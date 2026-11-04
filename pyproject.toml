@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyradiant"
+version = "0.0.1"
+description = "RADIANT: Real-time ADIAbatic states for Nonadiabatic Trajectories"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Ruiyi Zhou", email = "ruiyi.zhou@phys.chem.ethz.ch" },
+]
+keywords = [
+    "nonadiabatic dynamics",
+    "surface hopping",
+    "real-time TDDFT",
+    "Ehrenfest dynamics",
+    "MASH",
+    "FSSH",
+]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/ruiyiQM/RADIANT"
+
+[tool.setuptools.packages.find]
+where = ["src"]

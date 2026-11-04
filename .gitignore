@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Simulation output
+*.npz
+*.chk
+*.out
+*.log
+/runs/
+
+# OS
+.DS_Store
