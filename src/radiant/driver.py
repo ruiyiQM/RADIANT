@@ -186,25 +186,34 @@ class Trajectory:
                 os.unlink(temporary)
 
 
-def follow_path(execution, positions, times, *, method=None, n_substeps=1):
+def follow_path(execution, positions, times, *, midpoints=None, method=None, n_substeps=1):
     """Propagate a prescribed Bohr path; MASH variables evolve without hops.
 
     The first geometry/time must be the current accepted endpoint. Subsequent
     times are explicit physical times; no time grid or nuclear path is guessed.
+    Optional midpoints supply one Bohr geometry per segment; otherwise the
+    endpoint average is used. Archived midpoint geometries are passed unchanged.
     """
-    positions, times = np.asarray(positions), np.asarray(times)
+    positions, times = np.asarray(positions, dtype=float), np.asarray(times, dtype=float)
     if (times.ndim != 1 or len(times) < 1 or positions.shape != (len(times), *execution.positions.shape)
-            or not np.isfinite(times).all() or np.any(np.diff(times) <= 0)
+            or not np.isfinite(positions).all() or not np.isfinite(times).all() or np.any(np.diff(times) <= 0)
             or not np.isclose(times[0], execution.time, atol=1e-12, rtol=0)
             or not np.allclose(positions[0], execution.positions, atol=1e-12, rtol=0)):
         raise ValueError("Path must start at the accepted geometry/time and increase in time")
+    if midpoints is not None:
+        midpoints = np.asarray(midpoints, dtype=float)
+        if (midpoints.shape != (len(times)-1, *execution.positions.shape)
+                or not np.isfinite(midpoints).all()):
+            raise ValueError("Supply one finite midpoint geometry per path segment")
     observation = execution.observe(forces=False)
     frames = []
-    for end, time in zip(positions[1:], times[1:]):
+    for index, (end, time) in enumerate(zip(positions[1:], times[1:])):
         before = execution.snapshot()
         method_before = deepcopy(method)
         try:
-            result = execution.advance(end, time - observation.time, n_substeps=n_substeps, forces=False)
+            result = execution.advance(end, time - observation.time,
+                midpoint=None if midpoints is None else midpoints[index],
+                n_substeps=n_substeps, forces=False)
             if method is not None:
                 method.propagate(observation.energies, result.observation.energies,
                                  result.overlap_raw, time - observation.time)

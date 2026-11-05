@@ -115,6 +115,37 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(run.time,40.)
         self.assertEqual(execution.time,40.)
 
+    def test_fixed_path_preserves_supplied_midpoints_and_times(self):
+        ToyProvider.trace=[]
+        run=LocalExecution([ToyProvider()])
+        path=np.zeros((4,1,3));path[:,0,0]=[0.,.1,.4,.5]
+        midpoints=np.zeros((3,1,3));midpoints[:,0,0]=[.03,.23,.49]
+        times=np.array([0.,.4,.8,1.2000000000000002])
+        frames=follow_path(run,path,times,midpoints=midpoints)
+        self.assertEqual(len(frames),3)
+        assert_allclose([f.observation.time for f in frames],times[1:],atol=0,rtol=0)
+        for index,frame in enumerate(frames):
+            calls=[position for _,time,position,_ in ToyProvider.trace
+                   if frame.left_time <= time <= frame.observation.time]
+            self.assertTrue(any(np.array_equal(position,midpoints[index]) for position in calls))
+        seen={position[0,0] for _,_,position,_ in ToyProvider.trace}
+        self.assertEqual(seen,set(midpoints[:,0,0]))
+        assert_allclose(run.positions,path[-1],atol=0,rtol=0)
+
+    def test_invalid_fixed_path_geometry_is_rejected_before_propagation(self):
+        path=np.zeros((4,1,3));times=[0.,.4,.8,1.2]
+        invalid=np.zeros((3,1,3));invalid[-1,0,0]=np.nan
+        invalid_path=path.copy();invalid_path[-1,0,0]=np.nan
+        for positions,midpoints in ((path,invalid),(path,np.zeros((2,1,3))),
+                                     (invalid_path,None)):
+            ToyProvider.trace=[]
+            run=LocalExecution([ToyProvider()])
+            with self.assertRaises(ValueError):
+                follow_path(run,positions,times,midpoints=midpoints)
+            self.assertEqual(ToyProvider.trace,[])
+            self.assertEqual(run.time,0.)
+            assert_allclose(run.positions,path[0],atol=0,rtol=0)
+
     def test_output_failure_rolls_back_and_preserves_previous_file(self):
         execution=LocalExecution([ToyProvider(force=.1)])
         run=Trajectory(execution,NuclearState([[0,0,0]],[[0,0,0]],[2.]))
