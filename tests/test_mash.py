@@ -31,7 +31,7 @@ from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_allclose
-from scipy.linalg import expm
+from scipy.linalg import expm, logm
 
 from radiant.core.coupling import NACResult, PaperFD, ZeroNACError
 from radiant.core.execution import LocalExecution
@@ -100,6 +100,25 @@ class OverlapTests(unittest.TestCase):
 
 
 class FDTests(unittest.TestCase):
+    def test_selected_recomputed_table1_direction_benchmark(self):
+        from pyscf import gto,scf
+        from radiant.backends.pyscf import PySCFProvider
+        from radiant.core.propagation import CNOptions
+        with np.load(Path(__file__).parent/"fixtures/table1_recomputed.npz",allow_pickle=False) as fixture:
+            mol=gto.M(atom=list(zip(("N","N","H","H"),fixture["positions_bohr"])),
+                      basis="6-31g*",unit="Bohr",verbose=0)
+            mf=scf.RHF(mol);mf.chkfile=None;mf.kernel()
+            assert_allclose(mf.get_ovlp(),fixture["overlap"],atol=1e-12,rtol=0)
+            states=tuple(OrbitalState((fixture[name+"_coeff"],),(fixture[name+"_occ"],))
+                         for name in ("ground","excited"))
+            execution=LocalExecution([PySCFProvider(mf,density_convention="paper_real") for _ in states],states)
+            for dt,expected in zip(fixture["dt_au"],fixture["absolute_dot"]):
+                result=PaperFD(dt=float(dt),options=CNOptions(tolerance=1e-6,max_iterations=40)).compute(execution)
+                dot=np.sum(result.real_direction*fixture["static_direction"])
+                self.assertGreater(dot,0.)
+                assert_allclose(dot,expected,atol=1e-12,rtol=0)
+                self.assertEqual(execution.time,0.)
+
     def test_native_pyscf_signed_probe_matches_frozen_paper_axis(self):
         from pyscf import gto,scf
         from radiant.backends.pyscf import PySCFProvider
@@ -178,13 +197,19 @@ class SpinTests(unittest.TestCase):
         c=np.array([np.sqrt(.9),1j*np.sqrt(.1)])
         method=MASH(coefficients_to_spin(c))
         reference=method.coefficients.copy()
-        q=np.array([[np.cos(.2),-np.sin(.2)],[np.sin(.2),np.cos(.2)]],complex)
+        generator=np.array([[.03j,-1+.25j],[1+.25j,-.02j]])
+        overlap=expm(.2*generator)@np.diag([.94,.98])
         crossings=[]
         for step in range(1,21):
             old=method.active_state
-            method.propagate([0.,.3],[0.,.3],q,.4)
-            reference=np.diag(np.exp(-.2j*np.array([0.,.3])))@q.conj().T@np.diag(np.exp(-.2j*np.array([0.,.3])))@reference
+            method.propagate([0.,.3],[0.,.3],overlap,.4)
+            u,_,vh=np.linalg.svd(overlap)
+            reference=(expm(-.2j*np.diag([0.,.3]))@expm(-logm(u@vh))
+                       @expm(-.2j*np.diag([0.,.3]))@reference)
             assert_allclose(method.coefficients,reference,atol=1e-12,rtol=0)
+            cross=np.conj(reference[0])*reference[1]
+            legacy_spin=np.array([2*cross.real,2*cross.imag,abs(reference[0])**2-abs(reference[1])**2])
+            assert_allclose(method.spin,legacy_spin*[1,-1,-1],atol=1e-12,rtol=0)
             self.assertEqual(method.active_state,int(abs(reference[1])**2>abs(reference[0])**2))
             if method.active_state!=old:
                 crossings.append(step)
