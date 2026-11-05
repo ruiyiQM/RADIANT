@@ -20,12 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Copyright (c) 2026 Ruiyi Zhou
 """CN and Lowdin checks independent of an electronic-structure engine."""
 
 import unittest
 
 import numpy as np
 from numpy.testing import assert_allclose
+from scipy.integrate import solve_ivp
 from scipy.linalg import expm
 
 from radiant.core.propagation import CNOptions, StepFailure, crank_nicolson
@@ -95,6 +97,70 @@ class PropagationTests(unittest.TestCase):
             for c, n in zip(result.coefficients, counts):
                 self.assertEqual(c.shape, (3,n))
             assert_allclose(np.trace(result.density(), axis1=1, axis2=2), counts, atol=1e-12)
+
+    def test_joint_nonlinear_density_converges_to_independent_ode(self):
+        overlap = np.array([[1.2,.1,0.],[.1,1.,.05],[0.,.05,.9]])
+        inverse, _ = lowdin(overlap)
+        rng = np.random.default_rng(17)
+        q = np.linalg.qr(rng.normal(size=(3,3)) + 1j*rng.normal(size=(3,3)))[0]
+        state = OrbitalState((inverse[:, :2], inverse @ q[:, :1]), ([1,1], [1]))
+        h = np.array([[.2,.1j,.07],[-.1j,-.3,.04],[.07,.04,.4]])
+        field = np.diag([.03,-.02,.01])
+        alpha, start, duration = 2.5, .3, .8
+
+        def fock(dm, time):
+            common = h + .2*dm.sum(axis=0) + np.sin(.7*time)*field
+            return np.array([common-.1*dm[0], common-.1*dm[1]])
+
+        def rhs(time, flattened):
+            ca, cb = flattened[:6].reshape(3,2), flattened[6:].reshape(3,1)
+            dm = np.array([ca @ ca.conj().T, cb @ cb.conj().T])
+            ha, hb = fock(dm, time)
+            return np.concatenate(((-1j*alpha*np.linalg.solve(overlap, ha@ca)).ravel(),
+                                   (-1j*alpha*np.linalg.solve(overlap, hb@cb)).ravel()))
+
+        initial = np.concatenate([c.ravel() for c in state.coefficients])
+        reference = solve_ivp(rhs, (start,start+duration), initial, method="DOP853",
+                              rtol=3e-14, atol=1e-14)
+        self.assertTrue(reference.success, reference.message)
+        ca = reference.y[:6,-1].reshape(3,2)
+        cb = reference.y[6:,-1].reshape(3,1)
+        expected = np.array([ca@ca.conj().T, cb@cb.conj().T])
+        self.assertGreater(np.linalg.norm(expected-state.density()), .1)
+        for variant in ("cn", "cn_accelerated"):
+            errors = []
+            for count in (4,8,16):
+                candidate = state
+                for k in range(count):
+                    candidate, diagnostic = crank_nicolson(candidate, overlap, fock,
+                        start+k*duration/count, duration/count, alpha=alpha,
+                        options=CNOptions(variant, 2e-13, 120))
+                    self.assertLess(diagnostic.residual, 2e-13)
+                assert_allclose(np.trace(candidate.density()@overlap,axis1=1,axis2=2),
+                                [2.,1.],atol=1e-12,rtol=0)
+                errors.append(np.linalg.norm(candidate.density()-expected))
+            self.assertLess(errors[-1], 1e-3)
+            assert_allclose(np.array(errors[:-1])/errors[1:], 4., rtol=.035)
+
+    def test_cn_alpha_dt_equivalence_requires_an_autonomous_fock(self):
+        state = OrbitalState((np.array([[np.sqrt(.8)],[1j*np.sqrt(.2)]]),), ([2],))
+        h = np.array([[.2,.1j],[-.1j,-.3]])
+        for variant in ("cn", "cn_accelerated"):
+            for time_dependent in (False, True):
+                endpoints = []
+                for alpha, dt in ((3.,.1),(1.,.3)):
+                    times = []
+                    def fock(dm, time):
+                        times.append(time)
+                        return h+.3*dm + (np.sin(time)*np.diag([.2,-.1]) if time_dependent else 0.)
+                    final, _ = crank_nicolson(state,np.eye(2),fock,.7,dt,alpha=alpha,
+                        options=CNOptions(variant,1e-13,120))
+                    endpoints.append(final.density())
+                    self.assertEqual(set(times),{.7,.7+dt})
+                if time_dependent:
+                    self.assertGreater(np.linalg.norm(endpoints[0]-endpoints[1]),1e-4)
+                else:
+                    assert_allclose(endpoints[0],endpoints[1],atol=1e-12,rtol=0)
 
     def test_failed_and_invalid_trials_do_not_mutate_input(self):
         state = OrbitalState((np.eye(2, dtype=complex)[:, :1],), ([2],))
