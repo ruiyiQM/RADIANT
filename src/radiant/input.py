@@ -15,7 +15,7 @@ from .core.state import NuclearState
 
 
 def run_toml(path):
-    """Read atomic units explicitly, initialize once, and run single-state CN.
+    """Read atomic units explicitly, initialize once, and run single-state CN/PT-CN.
 
     Required sections are system, backend, state and trajectory. The system
     supplies an inline PySCF atom string, explicit Bohr units, nuclear masses

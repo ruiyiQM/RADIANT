@@ -41,16 +41,17 @@ file = "trajectory.npz"
 
 class InputTests(unittest.TestCase):
     def test_toml_runs_and_writes_only_in_its_output_directory(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            path=root/"input.toml"; path.write_text(INPUT)
-            run=run_toml(path)
-            self.assertEqual(run.time,.2)
-            self.assertEqual(len(run.frames),2)
-            with np.load(root/"trajectory.npz",allow_pickle=False) as data:
-                self.assertTrue(data["completed"])
-                assert_allclose(data["time"],[.1,.2],atol=0,rtol=0)
-            self.assertEqual({p.name for p in root.iterdir()},{"input.toml","trajectory.npz"})
+        for variant in ("cn_accelerated", "pt_cn"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder)
+                path=root/"input.toml"; path.write_text(INPUT.replace("cn_accelerated", variant))
+                run=run_toml(path)
+                self.assertEqual(run.time,.2)
+                self.assertEqual(len(run.frames),2)
+                with np.load(root/"trajectory.npz",allow_pickle=False) as data:
+                    self.assertTrue(data["completed"])
+                    assert_allclose(data["time"],[.1,.2],atol=0,rtol=0)
+                self.assertEqual({p.name for p in root.iterdir()},{"input.toml","trajectory.npz"})
 
     def test_units_unknown_fields_and_unprepared_excited_state_are_rejected(self):
         for text in (INPUT.replace('unit = "Bohr"','unit = "angstrom"'),
