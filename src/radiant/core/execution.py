@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .propagation import CNOptions, crank_nicolson
+from .propagation import CNOptions, crank_nicolson, validate_pt_state
 from .transport import transport
 
 
@@ -56,6 +56,7 @@ class LocalExecution:
         if len(self.alphas) != len(self.states) or not np.isfinite(self.alphas).all() or min(self.alphas) <= 0:
             raise ValueError("Each electronic state needs a positive finite alpha")
         self.options = options
+        self._validate_propagation(options)
         self.time = float(time)
         self._identity = object()
         self.gauge = None
@@ -79,6 +80,12 @@ class LocalExecution:
     @property
     def positions(self):
         return self.providers[0].positions.copy()
+
+    def _validate_propagation(self, options):
+        if options.variant == "pt_cn":
+            if len(self.states) != 1:
+                raise ValueError("PT-CN is validated only for single-state execution")
+            validate_pt_state(self.states[0])
 
     def observe(self, *, forces=True):
         energies = np.array([p.energy(s) for p, s in zip(self.providers, self.states)])
@@ -130,6 +137,8 @@ class LocalExecution:
         scales = self.alphas if alphas is None else tuple(alphas)
         if len(scales) != len(self.states) or not np.isfinite(scales).all() or min(scales) <= 0:
             raise ValueError("Each state needs a positive finite alpha")
+        propagation = self.options if options is None else options
+        self._validate_propagation(propagation)
         before = self.snapshot()
         anchor = before if gauge_reference is None else gauge_reference
         self._validate_snapshot(anchor)
@@ -143,7 +152,7 @@ class LocalExecution:
                 for k in range(n_substeps):
                     state, diagnostic = crank_nicolson(state, middle_overlap, provider.fock,
                         before.time + k * dt / n_substeps, dt / n_substeps, alpha=alpha,
-                        options=self.options if options is None else options)
+                        options=propagation)
                     diagnostics.append(diagnostic)
                 new_overlap = provider.prepare_geometry(end)
                 states[i] = transport(state, middle_overlap, new_overlap)
