@@ -110,6 +110,28 @@ class PySCFTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PySCFProvider(mf.density_fit())
 
+    def test_range_separated_complex_forces_and_unequal_spins(self):
+        for unrestricted in (False,True):
+            mol=gto.M(atom="He 0 0 0; H .2 0 1.4",basis="6-31g",unit="Bohr",
+                      charge=0 if unrestricted else 1,spin=int(unrestricted),verbose=0)
+            mf=(dft.UKS if unrestricted else dft.RKS)(mol,xc="wb97x")
+            mf.grids.level=1;mf.grids.prune=None;mf.chkfile=None;mf.kernel()
+            provider=PySCFProvider(mf)
+            inverse,_=lowdin(provider.overlap)
+            rng=np.random.default_rng(23)
+            q=np.linalg.qr(rng.normal(size=(4,4))+1j*rng.normal(size=(4,4)))[0]
+            state=OrbitalState((inverse@q[:,:2],inverse@q[:,2:3]) if unrestricted else (inverse@q[:,:1],),
+                               ([1,1],[1]) if unrestricted else ([2],))
+            force=provider.forces(state)
+            original,overlap=provider.positions,provider.overlap
+            for axis in (0,2):
+                energies=[]
+                for sign in (1,-1):
+                    trial=deepcopy(provider);positions=original.copy();positions[0,axis]+=sign*1e-4
+                    trial.prepare_geometry(positions)
+                    energies.append(trial.energy(transport(state,overlap,trial.overlap)))
+                assert_allclose(force[0,axis],-(energies[0]-energies[1])/2e-4,atol=2e-7,rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

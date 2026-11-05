@@ -24,9 +24,11 @@ class OrbitalState:
                                 for f in self.occupations)
         if len(self.coefficients) not in (1, 2) or len(self.occupations) != len(self.coefficients):
             raise ValueError("Use one restricted or two unrestricted blocks")
+        if self.coefficients[0].ndim != 2:
+            raise ValueError("Orbital blocks must be matrices")
         nao = self.coefficients[0].shape[0]
         for c, f in zip(self.coefficients, self.occupations):
-            if c.ndim != 2 or c.shape != (nao, len(f)) or f.ndim != 1:
+            if c.ndim != 2 or f.ndim != 1 or c.shape != (nao, f.size):
                 raise ValueError("Orbital/occupation dimensions do not match")
             if not np.isfinite(c).all() or not np.isfinite(f).all():
                 raise ValueError("Orbitals and occupations must be finite")
@@ -56,8 +58,8 @@ class NuclearState:
         self.positions = np.array(self.positions, dtype=float, copy=True)
         self.momenta = np.array(self.momenta, dtype=float, copy=True)
         self.masses = np.array(self.masses, dtype=float, copy=True)
-        if (self.positions.shape != (len(self.masses), 3)
-                or self.momenta.shape != self.positions.shape or self.masses.ndim != 1):
+        if (self.masses.ndim != 1 or self.positions.shape != (self.masses.size, 3)
+                or self.momenta.shape != self.positions.shape):
             raise ValueError("Nuclear coordinates, momenta and masses do not match")
         if (not all(np.isfinite(a).all() for a in (self.positions, self.momenta, self.masses))
                 or np.any(self.masses <= 0)):

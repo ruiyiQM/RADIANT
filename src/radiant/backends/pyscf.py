@@ -50,8 +50,16 @@ class PySCFProvider:
         if self.unrestricted and density_convention == "paper_real":
             raise ValueError("paper_real is a restricted paper convention")
         self.mf = deepcopy(mean_field)
+        self.mf._opt = {}  # PySCF serialization clears this lazy direct-SCF cache to None.
         self.density_convention = density_convention
         self._validate_model()
+
+    def __deepcopy__(self, memo):
+        result = type(self).__new__(type(self))
+        memo[id(self)] = result
+        result.__dict__ = deepcopy(self.__dict__, memo)
+        result.mf._opt = {}
+        return result
 
     def _validate_model(self):
         if self.mf.mol.has_ecp() or self.mf.mol._pseudo:
