@@ -4,12 +4,12 @@ project(RADIANT LANGUAGES NONE)
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
-    execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy, scipy, pyscf"
+    execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy, scipy, pyscf; assert tuple(map(int, pyscf.__version__.split('.')[:2])) >= (2, 12)"
         RESULT_VARIABLE dependency_status ERROR_VARIABLE dependency_error)
     if(NOT dependency_status EQUAL 0)
-        message(FATAL_ERROR "Regression environment requires NumPy, SciPy and PySCF: ${dependency_error}")
+        message(FATAL_ERROR "Regression environment requires NumPy, SciPy and PySCF >=2.12: ${dependency_error}")
     endif()
-    foreach(suite numerics propagation pyscf)
+    foreach(suite numerics propagation pyscf execution mash input)
         add_test(NAME ${suite} COMMAND "${Python3_EXECUTABLE}" -m unittest discover
             -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p "test_${suite}.py" -v)
         set_tests_properties(${suite} PROPERTIES

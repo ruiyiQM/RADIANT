@@ -1,0 +1,59 @@
+{
+  "source_commit": "ca4bee40b1291100e76f1b745b91c58cd6e5dba6",
+  "source_sha256": {
+    "src/tdmash/FD.py": "4b37eeb0c3596b57c20e626f90a5cb50f12684353800b1fb2b58afdb0f7f4141",
+    "src/tdmash/TDOverlap.py": "0763d487217a61be51a042e46fe4b202142c08548d187d6cc46c71565939635d",
+    "src/tdmash/TDRHF.py": "bf9989cdb0a8ed9296e347b00cabdb188e5a290ee6ed6c598ee699245ebc94c2"
+  },
+  "purpose": "Small HeH+ signed-probe algorithm regression, not Table 1 or published-number reproduction",
+  "atom": "He 0 0 0; H 0 0 1.4",
+  "basis": "sto-3g",
+  "unit": "Bohr",
+  "charge": 1,
+  "coefficients_real": [
+    [
+      [
+        0.8721657017825666
+      ],
+      [
+        0.20279747154528582
+      ]
+    ],
+    [
+      [
+        0.8721657017825666,
+        -0.8348006846846281
+      ],
+      [
+        0.20279747154528582,
+        1.1901421679995374
+      ]
+    ]
+  ],
+  "occupations": [
+    [
+      2
+    ],
+    [
+      1,
+      1
+    ]
+  ],
+  "dt": 4.0,
+  "alpha": 1.0,
+  "displacement": 0.01,
+  "tolerance": 1e-12,
+  "max_iterations": 200,
+  "expected_direction": [
+    [
+      1.503492990526022e-14,
+      1.503492990526022e-14,
+      -0.951794272294566
+    ],
+    [
+      2.0009942278814e-14,
+      2.0009942278814e-14,
+      -0.30673712397956887
+    ]
+  ]
+}
