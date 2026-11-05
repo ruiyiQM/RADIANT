@@ -1,7 +1,7 @@
 """RADIANT: Real-time ADIAbatic states for Nonadiabatic Trajectories.
 
-Early development release. Only the numerical utilities in
-:mod:`radiant.numerics` are available; the dynamics API is not yet stable.
+Early development release. The dynamics API is not yet stable.
+Scientific-engine imports remain in their backend modules.
 """
 
 from .numerics import cayley_frequency, inverse_cayley_frequency
