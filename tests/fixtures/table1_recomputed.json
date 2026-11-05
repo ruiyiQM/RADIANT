@@ -1,0 +1,32 @@
+{
+  "purpose": "Minimal recomputed Table1 direction regression; no trajectories, original orbitals or NAC magnitudes are claimed.",
+  "selection": "TDMASH strategy message msg_63faba91057c selects the 2026-10-28 recomputation as the benchmark.",
+  "repository": "https://github.com/ruiyiQM/TDMASH_pack.git",
+  "scientific_source_commit": "ca4bee40b1291100e76f1b745b91c58cd6e5dba6",
+  "reference_directory": "runs/table1_20261028",
+  "reference_metadata_sha256": "9ccc142780e739b6e4f9a161ed4aaf5cefeb4e64ba716d73a2c8ebcea59a34e0",
+  "reference_vectors_sha256": "23d49616a28956f5194a08ea0324ca4b728b1c806d050d2a009040b5d7acd886",
+  "initial_state": "Fresh RHF ground/MOM singlet computed from the paper-tag MOM routine in RADIANT local validation; not the missing original Table1 orbital files. Occupied coefficients and AO overlap are stored explicitly.",
+  "versions": {
+    "numpy": "2.5.4",
+    "scipy": "1.18.1",
+    "pyscf": "2.15.0"
+  },
+  "model": "RHF/6-31g*",
+  "symbols": [
+    "N",
+    "N",
+    "H",
+    "H"
+  ],
+  "unit": "Bohr",
+  "probe": {
+    "alpha": 1.0,
+    "displacement": 0.01,
+    "variant": "cn_accelerated",
+    "tolerance": 1e-06,
+    "max_iterations": 40
+  },
+  "fixture_sha256": "814429e1c5945f3fe69a289ac2ee1f56719f791ab3ac35defb912755ee814c87",
+  "fixture_bytes": 8970
+}
