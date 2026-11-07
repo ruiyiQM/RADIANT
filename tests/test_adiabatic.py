@@ -3,6 +3,7 @@
 """Adiabatic following on an exactly solvable, rotating two-level path."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 from numpy.testing import assert_allclose
@@ -11,6 +12,7 @@ from scipy.linalg import expm
 
 from radiant.core.propagation import CNOptions, crank_nicolson
 from radiant.core.state import OrbitalState
+from radiant.core.execution import LocalExecution
 
 
 class AdiabaticFollowingTests(unittest.TestCase):
@@ -96,6 +98,76 @@ class AdiabaticFollowingTests(unittest.TestCase):
             with self.subTest(shift=shift):
                 self.assertLess(relative_error.max(), .01)
                 self.assertLess(solver_change.max(), .01*relative_error.max())
+
+    def test_large_alpha_moving_lowdin_basis_preserves_density(self):
+        left_half = MovingLowdinProvider().half(0.)
+        left = left_half @ left_half
+        right_half = MovingLowdinProvider().half(2.)
+        right = right_half @ right_half
+        self.assertGreater(np.linalg.norm(left @ right-right @ left), .001)
+        for variant in ("cn_accelerated", "pt_cn"):
+            paths = []
+            for orthogonal in (True, False):
+                run = LocalExecution([MovingLowdinProvider(orthogonal=orthogonal)],
+                    alphas=[80.], options=CNOptions(variant, 2e-12, 120))
+                densities = []
+                for step in range(64):
+                    frame = run.advance([[(step+1)/16, 0., 0.]], 1/16,
+                                        n_substeps=4, forces=False)
+                    half = run.providers[0].half(run.positions[0, 0])
+                    densities.append(half @ run.states[0].density() @ half)
+                    self.assertTrue(all(d.residual <= 2e-12 and d.orthogonality_error < 1e-10
+                                        for d in frame.diagnostics))
+                paths.append(np.array(densities))
+            with self.subTest(variant=variant):
+                assert_allclose(paths[0], paths[1], atol=2e-9, rtol=0)
+
+
+class MovingLowdinProvider:
+    """The same rotating model represented in a noncommuting moving AO metric."""
+
+    def __init__(self, *, orthogonal=False):
+        self.orthogonal = orthogonal
+        self.fock_calls = 0
+        self.mf = SimpleNamespace()
+        self.prepare_geometry([[0., 0., 0.]])
+
+    @property
+    def positions(self):
+        return self.mf.mol.copy()
+
+    @property
+    def overlap(self):
+        return self.metric_half @ self.metric_half
+
+    def half(self, q):
+        if self.orthogonal:
+            return np.eye(2)
+        rotation = np.cos(.37*q)*np.eye(2) + np.sin(.37*q)*AdiabaticFollowingTests.generator
+        return rotation @ np.diag(np.exp([.12*np.sin(.7*q), .18*np.cos(.4*q)])) @ rotation.T
+
+    def prepare_geometry(self, positions):
+        self.mf.mol = np.array(positions, dtype=float, copy=True)
+        q = self.positions[0, 0]
+        self.metric_half = self.half(q)
+        angle = AdiabaticFollowingTests.rate*q
+        rotation = np.cos(angle)*np.eye(2) + np.sin(angle)*AdiabaticFollowingTests.generator
+        hamiltonian = rotation @ AdiabaticFollowingTests.diagonal @ rotation.T
+        self.ao_fock = self.metric_half @ hamiltonian @ self.metric_half
+        return self.overlap
+
+    def initial_state(self):
+        return OrbitalState((np.linalg.solve(self.metric_half, AdiabaticFollowingTests.initial),), ([2],))
+
+    def fock(self, density, time):
+        self.fock_calls += 1
+        return self.ao_fock
+
+    def energy(self, state):
+        return float(np.trace(state.density() @ self.ao_fock).real)
+
+    def cross_overlap(self, left, right):
+        return self.half(left[0, 0]) @ self.half(right[0, 0])
 
 
 if __name__ == "__main__":
