@@ -32,15 +32,15 @@ class AdiabaticFollowingTests(unittest.TestCase):
         effective = alpha*self.diagonal - 1j*self.rate*self.generator
         return self.rotation(time) @ expm(-1j*time*effective) @ self.initial
 
-    def trajectory(self, variant, alpha, steps):
+    def trajectory(self, variant, alpha, steps, *, energy_shift=0., tolerance=2e-12):
         state = OrbitalState((self.initial,), ([2],))
         overlap = np.eye(2)
-        options = CNOptions(variant, 2e-12, 120)
+        options = CNOptions(variant, tolerance, 120)
         dt = self.duration/steps
         densities = []
         for step in range(steps):
             state, diagnostic = crank_nicolson(state, overlap,
-                lambda dm, time: self.hamiltonian(time), step*dt, dt,
+                lambda dm, time: self.hamiltonian(time)+energy_shift*overlap, step*dt, dt,
                 alpha=alpha, options=options)
             self.assertLessEqual(diagnostic.residual, options.tolerance)
             self.assertLess(diagnostic.orthogonality_error, 1e-10)
@@ -85,6 +85,17 @@ class AdiabaticFollowingTests(unittest.TestCase):
                     assert_allclose(leakage.max(), bound, rtol=.02, atol=1e-7)
                 maxima.append(leakage.max())
             self.assertTrue(all(left > right for left, right in zip(maxima, maxima[1:])))
+
+    def test_large_step_pt_resolves_a_shifted_rotating_path(self):
+        for shift in (-5., 5.):
+            times, densities = self.trajectory("pt_cn", 80., 64, energy_shift=shift)
+            _, tighter = self.trajectory("pt_cn", 80., 64, energy_shift=shift, tolerance=2e-13)
+            # The scalar shift changes the exact orbital phase, but not its density.
+            relative_error = self.density_errors(times, densities, 80.)/2
+            solver_change = np.linalg.norm(densities-tighter, axis=(1, 2))/2
+            with self.subTest(shift=shift):
+                self.assertLess(relative_error.max(), .01)
+                self.assertLess(solver_change.max(), .01*relative_error.max())
 
 
 if __name__ == "__main__":
