@@ -95,12 +95,12 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
         validate_pt_state(state)
     nspin = len(state.coefficients)
 
-    def evaluate(trial, t):
+    def evaluate(trial, t, iterations=0):
         value = np.asarray(fock(trial.density(), t), dtype=complex)
         matrices = value[None] if nspin == 1 else value
         if (matrices.shape != (nspin, *np.shape(overlap)) or not np.isfinite(matrices).all()
                 or not np.allclose(matrices, matrices.conj().transpose(0, 2, 1), atol=1e-12, rtol=0)):
-            raise StepFailure("Fock provider returned invalid/non-Hermitian matrices")
+            raise StepFailure("Fock provider returned invalid/non-Hermitian matrices", iterations=iterations)
         return matrices * alpha
 
     if options.variant == "pt_cn":
@@ -204,7 +204,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
         accelerator = AndersonAcceleration(history_size=6, regularization=1e-12)
         for iteration in range(1, options.max_iterations + 1):
             trial = OrbitalState(tuple(blocks), state.occupations)
-            final = evaluate(trial, time + dt)
+            final = evaluate(trial, time + dt, iteration)
             errors = [r - c - 1j * half_dt * action(c, h) for r, c, h in zip(rhs, blocks, final)]
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
             if not np.isfinite(residual):
@@ -233,7 +233,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 root = cholesky(c.conj().T @ overlap @ c, lower=True)
                 blocks[i] = solve_triangular(root, c.conj().T, lower=True).conj().T
         accepted = OrbitalState(tuple(blocks), state.occupations)
-        evaluate(accepted, time + dt)
+        evaluate(accepted, time + dt, iteration)
         orthogonality = accepted.orthogonality_error(overlap)
         if orthogonality > 1e-8:
             raise StepFailure("PT-CN orthogonality failed", residual=residual, iterations=iteration)

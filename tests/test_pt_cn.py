@@ -204,6 +204,109 @@ class PTCNTests(unittest.TestCase):
         self.assertGreater(failure.exception.residual, 1e-3)
         self.assertEqual(failure.exception.iterations, 3)
 
+    def test_initial_invalid_fock_reports_zero_iterations(self):
+        state = OrbitalState((np.eye(2)[:, :1],), ([2],))
+        before = state.coefficients[0].copy()
+        with self.assertRaises(StepFailure) as failure:
+            crank_nicolson(state, np.eye(2), lambda d, t: np.full((2, 2), np.nan),
+                           0., .1, options=OPTIONS)
+        self.assertEqual(str(failure.exception), 'Fock provider returned invalid/non-Hermitian matrices')
+        self.assertEqual(failure.exception.iterations, 0)
+        self.assertEqual(failure.exception.residual, np.inf)
+        self.assertIsNone(failure.exception.__cause__)
+        assert_array_equal(state.coefficients[0], before)
+
+    def test_invalid_fock_reports_first_and_later_attempted_iteration(self):
+        for call, expected in ((2, 1), (4, 3)):
+            with self.subTest(call=call):
+                state = OrbitalState((np.eye(2)[:, :1],), ([2],))
+                before = state.coefficients[0].copy()
+                calls = []
+                def fock(density, time):
+                    calls.append(time)
+                    return np.full((2, 2), np.nan) if len(calls) == call else np.array([[0., .2], [.2, .1]])
+                with self.assertRaises(StepFailure) as failure:
+                    crank_nicolson(state, np.eye(2), fock, 0., .1,
+                                   options=CNOptions('pt_cn', 1e-30, 10))
+                self.assertEqual(len(calls), call)
+                self.assertEqual(str(failure.exception), 'Fock provider returned invalid/non-Hermitian matrices')
+                self.assertEqual(failure.exception.residual, np.inf)
+                self.assertIsNone(failure.exception.__cause__)
+                assert_array_equal(state.coefficients[0], before)
+                self.assertEqual(failure.exception.iterations, expected)
+
+    def test_provider_stepfailure_preserves_identity_residual_and_cause(self):
+        for fail_call in (1, 2):
+            for iterations in (0, 37):
+                with self.subTest(fail_call=fail_call, iterations=iterations):
+                    state = OrbitalState((np.eye(2)[:, :1],), ([2],))
+                    before = state.coefficients[0].copy()
+                    cause = ValueError('underlying failure')
+                    original = StepFailure('provider failure', residual=.25, iterations=iterations)
+                    calls = []
+                    def fock(density, time):
+                        calls.append(time)
+                        if len(calls) == fail_call:
+                            raise original from cause
+                        return np.array([[0., .2], [.2, .1]])
+                    with self.assertRaises(StepFailure) as failure:
+                        crank_nicolson(state, np.eye(2), fock, 0., .1, options=OPTIONS)
+                    self.assertIs(failure.exception, original)
+                    self.assertIs(type(failure.exception), StepFailure)
+                    self.assertEqual(str(failure.exception), 'provider failure')
+                    self.assertEqual(failure.exception.residual, .25)
+                    self.assertIs(failure.exception.__cause__, cause)
+                    self.assertEqual(failure.exception.iterations, iterations)
+                    self.assertEqual(len(calls), fail_call)
+                    assert_array_equal(state.coefficients[0], before)
+
+    def test_invalid_fock_at_accepted_validation_reports_last_iteration(self):
+        state = OrbitalState((np.eye(2)[:, :1],), ([2],))
+        before = state.coefficients[0].copy()
+        h = np.array([[0., .2], [.2, .1]])
+        _, diagnostic = crank_nicolson(state, np.eye(2), lambda d, t: h, 0., .1, options=OPTIONS)
+        self.assertGreater(diagnostic.iterations, 1)
+        calls = []
+        def fock(density, time):
+            calls.append(time)
+            return np.full((2, 2), np.nan) if len(calls) == diagnostic.iterations + 2 else h
+        with self.assertRaises(StepFailure) as failure:
+            crank_nicolson(state, np.eye(2), fock, 0., .1, options=OPTIONS)
+        self.assertEqual(len(calls), diagnostic.iterations + 2)
+        self.assertEqual(str(failure.exception), 'Fock provider returned invalid/non-Hermitian matrices')
+        self.assertEqual(failure.exception.iterations, diagnostic.iterations)
+        self.assertEqual(failure.exception.residual, np.inf)
+        self.assertIsNone(failure.exception.__cause__)
+        assert_array_equal(state.coefficients[0], before)
+
+    def test_in_loop_failure_reports_iteration_and_rolls_back_trajectory(self):
+        class InvalidSecondFock(ToyProvider):
+            def __init__(self):
+                super().__init__(force=.1)
+                self.calls = 0
+
+            def fock(self, density, time):
+                self.calls += 1
+                value = super().fock(density, time)
+                return np.full_like(value, np.nan) if self.calls == 2 else value
+
+        state = OrbitalState((np.eye(2)[:, :1],), ([2],))
+        run = Trajectory(LocalExecution([InvalidSecondFock()], [state], options=OPTIONS),
+                         NuclearState([[0, 0, 0]], [[.1, 0, 0]], [2.]))
+        before = deepcopy(run.nuclei)
+        with self.assertRaises(StepFailure) as failure:
+            run.step(.1, n_substeps=1)
+        self.assertEqual(failure.exception.iterations, 1)
+        self.assertEqual(failure.exception.residual, np.inf)
+        self.assertEqual(run.time, 0.)
+        self.assertEqual(run.execution.time, 0.)
+        assert_array_equal(run.nuclei.positions, before.positions)
+        assert_array_equal(run.nuclei.momenta, before.momenta)
+        assert_array_equal(run.execution.positions, before.positions)
+        assert_array_equal(run.execution.states[0].coefficients[0], state.coefficients[0])
+        self.assertIsNone(run.execution.providers[0].cache)
+        self.assertEqual(run.execution.providers[0].calls, 0)
+
     def test_unsupported_occupations_pairs_and_fd_fail_before_advancing(self):
         inverse = np.eye(2, dtype=complex)
         for occ in ([1], [2,0], []):
