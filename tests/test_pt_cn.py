@@ -510,5 +510,34 @@ class ProjectionDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(diagnostic.returned_residual, diagnostic.residual)
 
 
+class ClosedShellAndersonTests(unittest.TestCase):
+    def test_closed_shell_moving_basis_converges_at_large_alpha_dt(self):
+        # One closed-shell occupation group once kept a fixed Anderson
+        # regularization; this N2 step at alpha*dt = 10 then stalled near 1e-7.
+        from pyscf import dft, gto
+
+        def positions(bond):
+            return np.array([[0., 0., -bond/2], [0., 0., bond/2]])
+
+        bond, velocity, dt = 2.2, -.0058, .5
+        mol = gto.M(atom=[('N', p) for p in positions(bond)], unit='Bohr',
+                    basis='sto-3g', verbose=0)
+        mf = dft.RKS(mol, xc='pbe')
+        mf.chkfile, mf.grids.level, mf.grids.prune = None, 1, None
+        mf.conv_tol, mf.conv_tol_grad = 1e-12, 1e-8
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        run = LocalExecution([PySCFProvider(mf)], alphas=[20.],
+                             options=CNOptions('pt_cn', 1e-8, 120))
+        for step in range(4):
+            with self.subTest(step=step):
+                result = run.advance(positions(bond + velocity*dt), dt,
+                                     midpoint=positions(bond + velocity*dt/2), n_substeps=1)
+                bond += velocity*dt
+                diagnostic = result.diagnostics[0]
+                self.assertLessEqual(diagnostic.residual, 1e-8)
+                self.assertLess(diagnostic.iterations, 20)
+
+
 if __name__ == '__main__':
     unittest.main()

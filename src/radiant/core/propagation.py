@@ -261,8 +261,10 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             current = np.concatenate([c.ravel() for c in blocks])
             candidate = np.concatenate([(c + precondition(r)).ravel()
                                         for c, r, precondition in zip(blocks, errors, preconditioners)])
-            if len(blocks) > 1:
-                accelerator.regularization = 1e-12 * np.linalg.norm(candidate - current)**2
+            # Scale the Tikhonov term with the update for every block count: a
+            # fixed value swamps the shrinking history near convergence, which
+            # turns Anderson off and stalls large alpha*dt steps.
+            accelerator.regularization = 1e-12 * np.linalg.norm(candidate - current)**2
             # Real mixing retains the real-linear dependence on C and C*.
             mixed = accelerator.compute(np.stack((current.real, current.imag)),
                                         np.stack((candidate.real, candidate.imag)))
