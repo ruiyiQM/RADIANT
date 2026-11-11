@@ -9,7 +9,7 @@ if(BUILD_TESTING)
     if(NOT dependency_status EQUAL 0)
         message(FATAL_ERROR "Regression environment requires NumPy, SciPy and PySCF >=2.12: ${dependency_error}")
     endif()
-    foreach(suite numerics propagation pt_cn adiabatic pyscf execution mash input)
+    foreach(suite numerics propagation pt_cn pt_mixed adiabatic pyscf execution mash input)
         add_test(NAME ${suite} COMMAND "${Python3_EXECUTABLE}" -m unittest discover
             -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p "test_${suite}.py" -v)
         set_tests_properties(${suite} PROPERTIES

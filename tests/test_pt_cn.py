@@ -309,7 +309,8 @@ class PTCNTests(unittest.TestCase):
 
     def test_unsupported_occupations_pairs_and_fd_fail_before_advancing(self):
         inverse = np.eye(2, dtype=complex)
-        for occ in ([1], [2,0], []):
+        # Restricted 2/1 groups are accepted (test_pt_mixed); virtual columns are not.
+        for occ in ([2,0], [1,0], []):
             state = OrbitalState((inverse[:, :len(occ)],), (occ,))
             with self.assertRaises(ValueError):
                 crank_nicolson(state, np.eye(2), lambda d,t: self.fail('Fock must not be called'),

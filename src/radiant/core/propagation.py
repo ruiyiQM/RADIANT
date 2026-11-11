@@ -72,11 +72,27 @@ class Convergence:
 
 
 def validate_pt_state(state):
-    """Reject mixed occupations and virtual columns until their PT derivation."""
-    occupation = 2 if len(state.coefficients) == 1 else 1
+    """Accept restricted 2/1 or per-spin unit occupations; reject virtual columns."""
+    allowed = (1, 2) if len(state.coefficients) == 1 else (1,)
     if (not any(c.shape[1] for c in state.coefficients)
-            or any(not np.all(f == occupation) for f in state.occupations)):
-        raise ValueError("PT-CN requires fully occupied restricted/per-spin blocks without virtual columns")
+            or any(not np.isin(f, allowed).all() for f in state.occupations)):
+        raise ValueError("PT-CN requires occupied restricted (2/1) or per-spin unit blocks "
+                         "without virtual columns")
+
+
+def _occupation_groups(state):
+    """Return (spin, columns) blocks whose internal unitary mixing is a gauge.
+
+    Each unrestricted spin is one block. A restricted state is split into its
+    doubly and singly occupied columns: rotations inside each group leave the
+    density unchanged, while rotations between the groups change it and are
+    therefore retained as physical dynamics.
+    """
+    if len(state.coefficients) == 2:
+        return tuple((spin, np.arange(f.size)) for spin, f in enumerate(state.occupations))
+    occupations = state.occupations[0]
+    return tuple((0, np.flatnonzero(occupations == value)) for value in (2, 1)
+                 if np.any(occupations == value))
 
 
 def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOptions()):
@@ -185,11 +201,25 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
 
 
 def _parallel_transport(state, overlap, evaluate, time, dt, options):
-    """Joint real-block Anderson solve; evaluate supplies alpha-scaled Focks."""
-    initial = state.coefficients
+    """Joint real-block Anderson solve; evaluate supplies alpha-scaled Focks.
+
+    Blocks are occupation groups (see _occupation_groups). Each group removes
+    only its own internal rotation, A_g = S^-1 F C_g - C_g (C_g^H F C_g), so
+    restricted 2/1 groups share one Fock and keep their mutual coupling.
+    """
+    groups = _occupation_groups(state)
+    spins = [spin for spin, _ in groups]
+    initial = [state.coefficients[spin][:, columns] for spin, columns in groups]
     blocks = [c.copy() for c in initial]
     sizes = np.cumsum([0] + [c.size for c in initial])
     residual, change, iteration = np.inf, 0., 0
+
+    def assemble(parts):
+        coefficients = [np.empty_like(c) for c in state.coefficients]
+        for (spin, columns), part in zip(groups, parts):
+            coefficients[spin][:, columns] = part
+        return OrbitalState(tuple(coefficients), state.occupations)
+
     try:
         metric_factor = cho_factor(overlap)
 
@@ -199,13 +229,15 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
 
         start = evaluate(state, time)
         half_dt = .5 * dt
-        rhs = [c - 1j * half_dt * action(c, h) for c, h in zip(initial, start)]
-        preconditioners = [_pt_preconditioner(overlap, h, c, half_dt) for c, h in zip(initial, start)]
+        rhs = [c - 1j * half_dt * action(c, start[s]) for c, s in zip(initial, spins)]
+        preconditioners = [_pt_preconditioner(overlap, start[s], c, half_dt)
+                           for c, s in zip(initial, spins)]
         accelerator = AndersonAcceleration(history_size=6, regularization=1e-12)
         for iteration in range(1, options.max_iterations + 1):
-            trial = OrbitalState(tuple(blocks), state.occupations)
+            trial = assemble(blocks)
             final = evaluate(trial, time + dt, iteration)
-            errors = [r - c - 1j * half_dt * action(c, h) for r, c, h in zip(rhs, blocks, final)]
+            errors = [r - c - 1j * half_dt * action(c, final[s])
+                      for r, c, s in zip(rhs, blocks, spins)]
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
             if not np.isfinite(residual):
                 raise StepFailure("PT-CN residual is not finite", residual=residual, iterations=iteration)
@@ -214,7 +246,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             current = np.concatenate([c.ravel() for c in blocks])
             candidate = np.concatenate([(c + precondition(r)).ravel()
                                         for c, r, precondition in zip(blocks, errors, preconditioners)])
-            if len(blocks) == 2:
+            if len(blocks) > 1:
                 accelerator.regularization = 1e-12 * np.linalg.norm(candidate - current)**2
             # Real mixing retains the real-linear dependence on C and C*.
             mixed = accelerator.compute(np.stack((current.real, current.imag)),
@@ -228,11 +260,18 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             raise StepFailure("PT-CN nonlinear iteration did not converge", residual=residual,
                               iterations=options.max_iterations)
 
-        for i, c in enumerate(blocks):
-            if c.shape[1]:
-                root = cholesky(c.conj().T @ overlap @ c, lower=True)
-                blocks[i] = solve_triangular(root, c.conj().T, lower=True).conj().T
-        accepted = OrbitalState(tuple(blocks), state.occupations)
+        # Orthonormalize each spin jointly in group order (doubly occupied
+        # first), so the leading group's span is kept and groups end orthogonal.
+        for spin in range(len(state.coefficients)):
+            members = [i for i, s in enumerate(spins) if s == spin]
+            joint = np.concatenate([blocks[i] for i in members], axis=1)
+            if joint.shape[1]:
+                root = cholesky(joint.conj().T @ overlap @ joint, lower=True)
+                joint = solve_triangular(root, joint.conj().T, lower=True).conj().T
+            bounds = np.cumsum([0] + [blocks[i].shape[1] for i in members])
+            for k, i in enumerate(members):
+                blocks[i] = joint[:, bounds[k]:bounds[k + 1]]
+        accepted = assemble(blocks)
         evaluate(accepted, time + dt, iteration)
         orthogonality = accepted.orthogonality_error(overlap)
         if orthogonality > 1e-8:
