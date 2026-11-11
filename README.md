@@ -36,7 +36,7 @@ cmake -S . -B build -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
 ctest --test-dir build --output-on-failure
 ```
 
-The nine CTest suites contain 71 unittest methods. They exercise numerical
+The nine CTest suites contain 74 unittest methods. They exercise numerical
 utilities, CN and PT-CN, adiabatic following, moving Löwdin transport, PySCF
 energies and forces, snapshots and rollback, DTO/FD/MASH, and TOML input.
 The selected Table 1 fixture checks recomputed unit directions rather than
@@ -51,6 +51,10 @@ the missing original orbitals or general complex coupling magnitudes.
   Restricted doubly and singly occupied columns form separate gauge groups:
   only rotations inside a group are removed, while their mutual coupling is
   propagated. Two-state PT-CN and PT finite-difference couplings are rejected.
+  The trapezoidal PT-CN root is orthonormalized before it is returned; each
+  step's `Convergence` reports the root's Gram error
+  (`raw_orthogonality_error`) and the PT-CN residual of the returned orbitals
+  (`returned_residual`), so this projection can be monitored.
 - Molecular RHF/RKS/UHF/UKS Focks, physical energies, and forces at fixed
   symmetric Löwdin coordinates through `PySCFProvider`.
 - `LocalExecution`, `follow_path`, and `Trajectory` for local electronic
