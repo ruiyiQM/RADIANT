@@ -404,5 +404,111 @@ class PTCNTests(unittest.TestCase):
         self.assertGreater(errors[1]/errors[2], 3.5, errors)
 
 
+def projection_cases():
+    """Restricted 2/1, restricted closed-shell and unrestricted states, all far from stationary."""
+    from test_pt_mixed import mean_field_fock, random_model
+    state, overlap, core = random_model()
+    restricted = mean_field_fock(overlap, core)
+    closed = OrbitalState((state.coefficients[0][:, :2],), ([2, 2],))
+    inverse, _ = lowdin(overlap)
+    q = np.linalg.qr(np.random.default_rng(3).normal(size=(6, 6)) + 0j)[0]
+    unrestricted = OrbitalState((inverse @ q[:, :3], inverse @ q[:, 3:5]), ([1, 1, 1], [1, 1]))
+
+    def spin_fock(density, time):
+        return np.array([core + .1 * overlap @ (density[s].real + .5 * density[1 - s].real) @ overlap
+                         for s in (0, 1)])
+    return [('restricted_2_1', state, overlap, restricted), ('restricted_closed', closed, overlap, restricted),
+            ('unrestricted', unrestricted, overlap, spin_fock)]
+
+
+def pt_cn_residual(state, trial, overlap, fock, dt):
+    """Independent trapezoidal PT-CN residual; groups are (spin, occupation) column sets."""
+    def focks(s):
+        value = np.asarray(fock(s.density(), 0.))
+        return value[None] if value.ndim == 2 else value
+    start, final = focks(state), focks(trial)
+    errors = []
+    for spin, (c0, c1, f) in enumerate(zip(state.coefficients, trial.coefficients, state.occupations)):
+        for value in np.unique(f):
+            columns = np.flatnonzero(np.asarray(f) == value)
+
+            def action(c, h):
+                hc = h @ c
+                return np.linalg.solve(overlap, hc) - c @ (c.conj().T @ hc)
+            a, b = c0[:, columns], c1[:, columns]
+            errors.append(b - a + .5j * dt * (action(a, start[spin]) + action(b, final[spin])))
+    return float(np.linalg.norm([np.linalg.norm(e) for e in errors]))
+
+
+class ProjectionDiagnosticsTests(unittest.TestCase):
+    def test_raw_gram_defect_and_returned_residual_match_independent_root(self):
+        from scipy.optimize import root
+        dt = .5
+        for name, state, overlap, fock in projection_cases():
+            with self.subTest(case=name):
+                returned, diagnostic = crank_nicolson(state, overlap, fock, 0., dt, options=OPTIONS)
+                shapes = [c.shape for c in state.coefficients]
+                sizes = np.cumsum([0] + [int(np.prod(s)) for s in shapes])
+
+                def unpack(vector):
+                    z = vector[:sizes[-1]] + 1j * vector[sizes[-1]:]
+                    return OrbitalState(tuple(z[sizes[i]:sizes[i + 1]].reshape(s) for i, s in enumerate(shapes)),
+                                        state.occupations)
+
+                def equations(vector):
+                    trial = unpack(vector)
+                    start = np.asarray(fock(state.density(), 0.))
+                    final = np.asarray(fock(trial.density(), 0.))
+                    start, final = (start[None], final[None]) if start.ndim == 2 else (start, final)
+                    parts = []
+                    for spin, (c0, c1, f) in enumerate(zip(state.coefficients, trial.coefficients,
+                                                           state.occupations)):
+                        out = np.empty_like(c1)
+                        for value in np.unique(f):
+                            cols = np.flatnonzero(np.asarray(f) == value)
+                            a, b = c0[:, cols], c1[:, cols]
+                            act = [np.linalg.solve(overlap, h @ c) - c @ (c.conj().T @ h @ c)
+                                   for c, h in ((a, start[spin]), (b, final[spin]))]
+                            out[:, cols] = b - a + .5j * dt * (act[0] + act[1])
+                        parts.append(out.ravel())
+                    z = np.concatenate(parts)
+                    return np.concatenate((z.real, z.imag))
+
+                z0 = np.concatenate([c.ravel() for c in state.coefficients])
+                solution = root(equations, np.concatenate((z0.real, z0.imag)), method='hybr', tol=1e-13)
+                raw = unpack(solution.x)
+                self.assertLess(np.max(np.abs(equations(solution.x))), 1e-11)
+                independent_gram = raw.orthogonality_error(overlap)
+                # Non-vacuous: the trapezoidal root really leaves the orbital manifold here.
+                self.assertGreater(independent_gram, 1e-3)
+                self.assertAlmostEqual(diagnostic.raw_orthogonality_error, independent_gram, delta=1e-9)
+                self.assertLess(diagnostic.orthogonality_error, 1e-12)
+                independent_residual = pt_cn_residual(state, returned, overlap, fock, dt)
+                assert_allclose(diagnostic.returned_residual, independent_residual, rtol=1e-8, atol=1e-13)
+                self.assertGreater(diagnostic.returned_residual, 1e3 * diagnostic.residual)
+
+    def test_stationary_state_has_no_projection_defect(self):
+        name, state, overlap, fock = projection_cases()[1]
+        core = fock(state.density(), 0.)
+        inverse, _ = lowdin(overlap)
+        vectors = np.linalg.eigh(inverse @ core @ inverse)[1]
+        eigen = OrbitalState((inverse @ vectors[:, :2],), ([2, 2],))
+        for alpha in (1., 40.):
+            with self.subTest(alpha=alpha):
+                _, diagnostic = crank_nicolson(eigen, overlap, lambda d, t: core, 0., .5,
+                                               alpha=alpha, options=OPTIONS)
+                self.assertLess(diagnostic.raw_orthogonality_error, 1e-12)
+                self.assertLessEqual(diagnostic.returned_residual, OPTIONS.tolerance)
+
+    def test_cn_variants_return_the_root_so_raw_and_returned_coincide(self):
+        name, state, overlap, fock = projection_cases()[0]
+        for variant in ('cn', 'cn_accelerated'):
+            with self.subTest(variant=variant):
+                _, diagnostic = crank_nicolson(state, overlap, fock, 0., .1,
+                                               options=CNOptions(variant, 1e-12, 200))
+                self.assertEqual(diagnostic.raw_orthogonality_error, diagnostic.orthogonality_error)
+                self.assertEqual(diagnostic.returned_residual, diagnostic.residual)
+
+
 if __name__ == '__main__':
     unittest.main()

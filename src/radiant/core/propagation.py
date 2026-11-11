@@ -63,12 +63,26 @@ class CNOptions:
 
 @dataclass(frozen=True)
 class Convergence:
-    """PT residual is the joint raw AO norm before final orthonormalization."""
+    """Diagnostics of one accepted electronic step.
+
+    residual and coefficient_change describe the converged nonlinear root; for
+    PT-CN the residual is the joint raw AO norm before final orthonormalization.
+    orthogonality_error is the max Gram error of the returned orbitals.
+
+    The trapezoidal PT-CN root is not S-orthonormal, so PT-CN returns a
+    grouped Cholesky orthonormalization of it. raw_orthogonality_error is the
+    max Gram error of the root itself (all groups of a spin jointly), and
+    returned_residual is the PT-CN residual re-evaluated on the returned
+    orbitals, in the same norm as residual. Plain CN returns its root, so the
+    two fields equal orthogonality_error and residual.
+    """
 
     iterations: int
     residual: float
     coefficient_change: float
     orthogonality_error: float
+    raw_orthogonality_error: float = np.nan
+    returned_residual: float = np.nan
 
 
 def validate_pt_state(state):
@@ -149,7 +163,8 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
                     and (iteration > 1 or options.variant == "cn")):
                 if orthogonality > 1e-8:
                     raise StepFailure("CN orthogonality failed", residual=residual, iterations=iteration)
-                return candidate, Convergence(iteration, residual, change, orthogonality)
+                return candidate, Convergence(iteration, residual, change, orthogonality,
+                                              orthogonality, residual)
             guess = (accelerator.compute(guess, final)
                      if options.variant == "cn_accelerated" else final)
             previous = candidate
@@ -262,20 +277,28 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
 
         # Orthonormalize each spin jointly in group order (doubly occupied
         # first), so the leading group's span is kept and groups end orthogonal.
+        raw_orthogonality = 0.
         for spin in range(len(state.coefficients)):
             members = [i for i, s in enumerate(spins) if s == spin]
             joint = np.concatenate([blocks[i] for i in members], axis=1)
             if joint.shape[1]:
-                root = cholesky(joint.conj().T @ overlap @ joint, lower=True)
+                gram = joint.conj().T @ overlap @ joint
+                raw_orthogonality = max(raw_orthogonality,
+                                        float(np.max(np.abs(gram - np.eye(len(gram))))))
+                root = cholesky(gram, lower=True)
                 joint = solve_triangular(root, joint.conj().T, lower=True).conj().T
             bounds = np.cumsum([0] + [blocks[i].shape[1] for i in members])
             for k, i in enumerate(members):
                 blocks[i] = joint[:, bounds[k]:bounds[k + 1]]
         accepted = assemble(blocks)
-        evaluate(accepted, time + dt, iteration)
+        returned = evaluate(accepted, time + dt, iteration)
+        returned_residual = float(np.linalg.norm([
+            np.linalg.norm(r - c - 1j * half_dt * action(c, returned[s]))
+            for r, c, s in zip(rhs, blocks, spins)]))
         orthogonality = accepted.orthogonality_error(overlap)
         if orthogonality > 1e-8:
             raise StepFailure("PT-CN orthogonality failed", residual=residual, iterations=iteration)
-        return accepted, Convergence(iteration, residual, change, orthogonality)
+        return accepted, Convergence(iteration, residual, change, orthogonality,
+                                     raw_orthogonality, returned_residual)
     except np.linalg.LinAlgError as exc:
         raise StepFailure("PT-CN linear solve failed", residual=residual, iterations=iteration) from exc
