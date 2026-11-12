@@ -50,10 +50,16 @@ class CNOptions:
     variant: str = "cn_accelerated"
     tolerance: float = 1e-9
     max_iterations: int = 80
+    # Anderson history of the PT solvers; None keeps 6 for pt_cn (its
+    # published behaviour) and uses 20 for pt_im.
+    history: int | None = None
 
     def __post_init__(self):
-        if self.variant not in ("cn", "cn_accelerated", "pt_cn"):
-            raise ValueError("Supported propagators: cn, cn_accelerated, pt_cn")
+        if self.variant not in ("cn", "cn_accelerated", "pt_cn", "pt_im"):
+            raise ValueError("Supported propagators: cn, cn_accelerated, pt_cn, pt_im")
+        if self.history is not None and (not isinstance(self.history, int)
+                                         or isinstance(self.history, bool) or self.history < 1):
+            raise ValueError("history must be a positive integer or None")
         if not np.isfinite(self.tolerance) or self.tolerance <= 0:
             raise ValueError("Tolerance must be finite and positive")
         if (not isinstance(self.max_iterations, int) or isinstance(self.max_iterations, bool)
@@ -74,7 +80,10 @@ class Convergence:
     max Gram error of the root itself (all groups of a spin jointly), and
     returned_residual is the PT-CN residual re-evaluated on the returned
     orbitals, in the same norm as residual. Plain CN returns its root, so the
-    two fields equal orthogonality_error and residual.
+    two fields equal orthogonality_error and residual. The PT-IM root keeps
+    the Gram up to the solver tolerance; raw_orthogonality_error is that
+    defect, removed by a symmetric orthonormalization before returning, and
+    returned_residual is not evaluated (NaN).
     """
 
     iterations: int
@@ -85,13 +94,16 @@ class Convergence:
     returned_residual: float = np.nan
 
 
+PT_VARIANTS = ("pt_cn", "pt_im")
+
+
 def validate_pt_state(state):
     """Accept restricted 2/1 or per-spin unit occupations; reject virtual columns."""
     allowed = (1, 2) if len(state.coefficients) == 1 else (1,)
     if (not any(c.shape[1] for c in state.coefficients)
             or any(not np.isin(f, allowed).all() for f in state.occupations)):
-        raise ValueError("PT-CN requires occupied restricted (2/1) or per-spin unit blocks "
-                         "without virtual columns")
+        raise ValueError("PT propagation requires occupied restricted (2/1) or per-spin unit "
+                         "blocks without virtual columns")
 
 
 def _occupation_groups(state):
@@ -113,15 +125,16 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
     """Return a new state and diagnostics; fock(density, physical_time) is local.
 
     Both unrestricted Focks see the same joint trial density. Residuals are
-    measured in the original AO equation. PT-CN accepts occupied columns only.
-    Signed dt is allowed for field-free probes; alpha scales electronics only.
+    measured in the original AO equation. PT-CN and PT-IM accept occupied
+    columns only. Signed dt is allowed for field-free probes; alpha scales
+    electronics only.
     """
     if (not np.isfinite([time, dt, alpha]).all() or dt == 0 or alpha <= 0):
         raise ValueError("Require finite time, nonzero dt and positive alpha")
     lowdin(overlap)
     if state.orthogonality_error(overlap) > 1e-8:
         raise ValueError("Initial orbitals are not S-orthonormal")
-    if options.variant == "pt_cn":
+    if options.variant in PT_VARIANTS:
         validate_pt_state(state)
     nspin = len(state.coefficients)
 
@@ -133,7 +146,7 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
             raise StepFailure("Fock provider returned invalid/non-Hermitian matrices", iterations=iterations)
         return matrices * alpha
 
-    if options.variant == "pt_cn":
+    if options.variant in PT_VARIANTS:
         return _parallel_transport(state, overlap, evaluate, time, dt, options)
 
     def solve(average):
@@ -215,15 +228,48 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
     return precondition
 
 
+def _midpoint_phi(overlap, metric_factor, hamiltonian, mids):
+    """Grouped Gram-inverse PT field phi = S^-1 F M - M G^-1 B of one spin.
+
+    G = M^H S M is the full Gram of all groups of the spin, while
+    B = blockdiag_g(M_g^H F M_g) keeps only the intra-group gauge. B and G are
+    Hermitian, so M^H S phi is Hermitian and the root keeps the full Gram,
+    including the orthogonality between groups, without any projection.
+    """
+    joint = np.concatenate(mids, axis=1)
+    if not joint.shape[1]:
+        return [m.copy() for m in mids]
+    hm = hamiltonian @ joint
+    energies = joint.conj().T @ hm
+    bounds = np.cumsum([0] + [m.shape[1] for m in mids])
+    gauge = np.zeros_like(energies)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        gauge[lo:hi, lo:hi] = energies[lo:hi, lo:hi]
+    phi = (cho_solve(metric_factor, hm)
+           - joint @ np.linalg.solve(joint.conj().T @ overlap @ joint, gauge))
+    return [phi[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]
+
+
 def _parallel_transport(state, overlap, evaluate, time, dt, options):
     """Joint real-block Anderson solve; evaluate supplies alpha-scaled Focks.
 
     Blocks are occupation groups (see _occupation_groups). Each group removes
     only its own internal rotation, A_g = S^-1 F C_g - C_g (C_g^H F C_g), so
     restricted 2/1 groups share one Fock and keep their mutual coupling.
+
+    pt_cn solves the trapezoidal rule and orthonormalizes the root. pt_im
+    solves the implicit midpoint rule C1 - C0 + i dt phi(M) = 0 with
+    M = (C0 + C1)/2, the Fock of D_M = sum_g f_g M_g M_g^H at time + dt/2 and
+    the grouped field of _midpoint_phi. Its root keeps the Gram up to the
+    solver tolerance and only that defect is removed before returning.
     """
+    midpoint = options.variant == "pt_im"
+    label = "PT-IM" if midpoint else "PT-CN"
+    history = options.history if options.history is not None else (20 if midpoint else 6)
     groups = _occupation_groups(state)
     spins = [spin for spin, _ in groups]
+    members = [[i for i, s in enumerate(spins) if s == spin]
+               for spin in range(len(state.coefficients))]
     initial = [state.coefficients[spin][:, columns] for spin, columns in groups]
     blocks = [c.copy() for c in initial]
     sizes = np.cumsum([0] + [c.size for c in initial])
@@ -244,18 +290,43 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
 
         start = evaluate(state, time)
         half_dt = .5 * dt
-        rhs = [c - 1j * half_dt * action(c, start[s]) for c, s in zip(initial, spins)]
         preconditioners = [_pt_preconditioner(overlap, start[s], c, half_dt)
                            for c, s in zip(initial, spins)]
-        accelerator = AndersonAcceleration(history_size=6, regularization=1e-12)
+        if midpoint:
+            # The midpoint field has no occupied-span Jacobian of the PT-CN
+            # form: leave that component unpreconditioned, treat the rest natively.
+            def split(native, c0):
+                def precondition(r):
+                    q = c0 @ (c0.conj().T @ overlap @ r)
+                    p = native(r - q)
+                    return q + p - c0 @ (c0.conj().T @ overlap @ p)
+                return precondition
+            preconditioners = [split(native, c0) for native, c0 in zip(preconditioners, initial)]
+
+            def errors_of(parts, iteration):
+                mids = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
+                middle = evaluate(assemble(mids), time + half_dt, iteration)
+                errors = [None] * len(parts)
+                for spin, group in enumerate(members):
+                    if group:
+                        phis = _midpoint_phi(overlap, metric_factor, middle[spin], [mids[i] for i in group])
+                        for i, phi in zip(group, phis):
+                            errors[i] = initial[i] - parts[i] - 1j * dt * phi
+                return errors
+        else:
+            rhs = [c - 1j * half_dt * action(c, start[s]) for c, s in zip(initial, spins)]
+
+            def errors_of(parts, iteration):
+                final = evaluate(assemble(parts), time + dt, iteration)
+                return [r - c - 1j * half_dt * action(c, final[s])
+                        for r, c, s in zip(rhs, parts, spins)]
+
+        accelerator = AndersonAcceleration(history_size=history, regularization=1e-12)
         for iteration in range(1, options.max_iterations + 1):
-            trial = assemble(blocks)
-            final = evaluate(trial, time + dt, iteration)
-            errors = [r - c - 1j * half_dt * action(c, final[s])
-                      for r, c, s in zip(rhs, blocks, spins)]
+            errors = errors_of(blocks, iteration)
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
             if not np.isfinite(residual):
-                raise StepFailure("PT-CN residual is not finite", residual=residual, iterations=iteration)
+                raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
             if residual <= options.tolerance:
                 break
             current = np.concatenate([c.ravel() for c in blocks])
@@ -270,27 +341,50 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                                         np.stack((candidate.real, candidate.imag)))
             vector = mixed[0] + 1j * mixed[1]
             if not np.isfinite(vector).all():
-                raise StepFailure("PT-CN trial orbitals are not finite", residual=residual, iterations=iteration)
+                raise StepFailure(f"{label} trial orbitals are not finite", residual=residual, iterations=iteration)
             change = float(np.max(np.abs(vector - current), initial=0))
             blocks = [vector[sizes[i]:sizes[i+1]].reshape(c.shape) for i, c in enumerate(initial)]
         else:
-            raise StepFailure("PT-CN nonlinear iteration did not converge", residual=residual,
+            raise StepFailure(f"{label} nonlinear iteration did not converge", residual=residual,
                               iterations=options.max_iterations)
+
+        if midpoint:
+            # The exact root keeps the full Gram, so the converged one deviates
+            # only at the solver tolerance. A symmetric orthonormalization per
+            # spin removes that tolerance-sized defect without favouring a group;
+            # returned_residual is not evaluated to avoid an extra Fock build.
+            raw_orthogonality = 0.
+            for group in members:
+                joint = np.concatenate([blocks[i] for i in group], axis=1)
+                if joint.shape[1]:
+                    gram = joint.conj().T @ overlap @ joint
+                    raw_orthogonality = max(raw_orthogonality,
+                                            float(np.max(np.abs(gram - np.eye(len(gram))))))
+                    values, vectors = eigh(gram)
+                    joint = joint @ ((vectors * values**-.5) @ vectors.conj().T)
+                bounds = np.cumsum([0] + [blocks[i].shape[1] for i in group])
+                for k, i in enumerate(group):
+                    blocks[i] = joint[:, bounds[k]:bounds[k + 1]]
+            accepted = assemble(blocks)
+            orthogonality = accepted.orthogonality_error(overlap)
+            if raw_orthogonality > 1e-6 or orthogonality > 1e-8:
+                raise StepFailure("PT-IM orthogonality failed", residual=residual, iterations=iteration)
+            return accepted, Convergence(iteration, residual, change, orthogonality,
+                                         raw_orthogonality, np.nan)
 
         # Orthonormalize each spin jointly in group order (doubly occupied
         # first), so the leading group's span is kept and groups end orthogonal.
         raw_orthogonality = 0.
-        for spin in range(len(state.coefficients)):
-            members = [i for i, s in enumerate(spins) if s == spin]
-            joint = np.concatenate([blocks[i] for i in members], axis=1)
+        for spin, group in enumerate(members):
+            joint = np.concatenate([blocks[i] for i in group], axis=1)
             if joint.shape[1]:
                 gram = joint.conj().T @ overlap @ joint
                 raw_orthogonality = max(raw_orthogonality,
                                         float(np.max(np.abs(gram - np.eye(len(gram))))))
                 root = cholesky(gram, lower=True)
                 joint = solve_triangular(root, joint.conj().T, lower=True).conj().T
-            bounds = np.cumsum([0] + [blocks[i].shape[1] for i in members])
-            for k, i in enumerate(members):
+            bounds = np.cumsum([0] + [blocks[i].shape[1] for i in group])
+            for k, i in enumerate(group):
                 blocks[i] = joint[:, bounds[k]:bounds[k + 1]]
         accepted = assemble(blocks)
         returned = evaluate(accepted, time + dt, iteration)
@@ -303,4 +397,4 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
         return accepted, Convergence(iteration, residual, change, orthogonality,
                                      raw_orthogonality, returned_residual)
     except np.linalg.LinAlgError as exc:
-        raise StepFailure("PT-CN linear solve failed", residual=residual, iterations=iteration) from exc
+        raise StepFailure(f"{label} linear solve failed", residual=residual, iterations=iteration) from exc

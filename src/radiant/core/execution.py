@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .propagation import CNOptions, crank_nicolson, validate_pt_state
+from .propagation import PT_VARIANTS, CNOptions, crank_nicolson, validate_pt_state
 from .transport import transport
 
 
@@ -82,9 +82,9 @@ class LocalExecution:
         return self.providers[0].positions.copy()
 
     def _validate_propagation(self, options):
-        if options.variant == "pt_cn":
+        if options.variant in PT_VARIANTS:
             if len(self.states) != 1:
-                raise ValueError("PT-CN is validated only for single-state execution")
+                raise ValueError("PT propagation is validated only for single-state execution")
             validate_pt_state(self.states[0])
 
     def observe(self, *, forces=True):

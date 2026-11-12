@@ -53,8 +53,8 @@ class PaperFD:
         if (not np.isfinite([displacement, dt, alpha]).all()
                 or min(displacement, dt, alpha) <= 0 or steps != 1):
             raise ValueError("Paper FD requires positive parameters and steps=1")
-        if options.variant == "pt_cn":
-            raise ValueError("Paper FD does not support PT-CN branches")
+        if options.variant in ("pt_cn", "pt_im"):
+            raise ValueError("Paper FD does not support PT branches")
         self.displacement, self.dt, self.alpha = displacement, dt, alpha
         self.options = options
 
