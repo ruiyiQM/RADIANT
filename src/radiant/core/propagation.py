@@ -21,9 +21,11 @@
 # SOFTWARE.
 
 # Copyright (c) 2026 Ruiyi Zhou
-"""Self-consistent orbital CN and occupied-subspace PT-CN.
+"""Self-consistent orbital CN and occupied-subspace PT-CN and PT-IM.
 
 Orbital CN follows TDMASH v0.1.0; PT-CN follows frozen d448adb PT.py.
+PT-IM is the implicit midpoint rule of the PT dynamics (references in
+_parallel_transport).
 An unconverged candidate is never returned as an accepted state.
 """
 
@@ -256,11 +258,24 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     only its own internal rotation, A_g = S^-1 F C_g - C_g (C_g^H F C_g), so
     restricted 2/1 groups share one Fock and keep their mutual coupling.
 
-    pt_cn solves the trapezoidal rule and orthonormalizes the root. pt_im
-    solves the implicit midpoint rule C1 - C0 + i dt phi(M) = 0 with
-    M = (C0 + C1)/2, the Fock of D_M = sum_g f_g M_g M_g^H at time + dt/2 and
-    the grouped field of _midpoint_phi. Its root keeps the Gram up to the
-    solver tolerance and only that defect is removed before returning.
+    pt_cn solves the trapezoidal rule (Jia, An, Wang and Lin,
+    arXiv:1805.10575, Eq. 7) and orthonormalizes the root. pt_im solves the
+    implicit midpoint rule C1 - C0 + i dt phi(M) = 0 with M = (C0 + C1)/2,
+    the Fock of D_M = sum_g f_g M_g M_g^H at time + dt/2 and the grouped field
+    of _midpoint_phi. Its root keeps the Gram up to the solver tolerance and
+    only that defect is removed before returning.
+
+    The implicit midpoint rule for PT dynamics was proposed by An and Lin,
+    Multiscale Model. Simul. 18, 612 (2020), arXiv:1804.02095. With one group
+    per spin, pt_im is the PT-IM scheme of An, Fang and Lin, J. Comput. Phys.
+    451, 110850 (2022), arXiv:2105.14755, Eqs. 4.1-4.4 with a constant
+    occupation matrix, written in the S metric: the projector carries the
+    full Gram inverse and the midpoint density is not Gram-normalized. For
+    restricted 2/1 states that paper evolves an occupation matrix and removes
+    every rotation within the occupied span; here the occupations stay
+    diag(f_g) and only intra-group rotations are removed. Both forms give the
+    same continuous density dynamics, but this grouped form keeps the
+    occupation spectrum exact.
     """
     midpoint = options.variant == "pt_im"
     label = "PT-IM" if midpoint else "PT-CN"
