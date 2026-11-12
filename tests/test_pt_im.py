@@ -10,15 +10,17 @@ singly occupied groups, so no projection follows the solve.
 
 from copy import deepcopy
 import unittest
+from unittest import mock
 
 import numpy as np
 from numpy.testing import assert_allclose
 from pyscf import dft, gto
 from scipy.integrate import solve_ivp
-from scipy.linalg import expm
+from scipy.linalg import eigh, expm
 from scipy.optimize import root
 
 from radiant.backends.pyscf import PySCFProvider
+from radiant.core import propagation
 from radiant.core.coupling import PaperFD
 from radiant.core.execution import LocalExecution
 from radiant.core.propagation import CNOptions, crank_nicolson
@@ -229,6 +231,85 @@ class GroupedMidpointTests(unittest.TestCase):
         for history in (0, -1, 2.5, True):
             with self.subTest(history=history), self.assertRaises(ValueError):
                 CNOptions('pt_im', 1e-9, 80, history)
+
+
+class GroupPreconditionerTests(unittest.TestCase):
+    def test_closed_form_block_inverts_the_occupied_jacobian(self):
+        # With E = C0^H F C0 diagonal the closed form neglects nothing, and
+        # the occupied coordinates depend on F only through E. Orbital
+        # energies near -12 make the inter-group coupling tau |e_i + e_a| about 36.
+        rng = np.random.default_rng(11)
+        b = rng.normal(size=(7, 7))
+        overlap = np.eye(7) + .2 * b @ b.T / 7
+        a = rng.normal(size=(7, 7)) + 1j * rng.normal(size=(7, 7))
+        fock = .5 * (a + a.conj().T) - 12. * overlap
+        # A random occupied span, rotated so that E is diagonal; the span is
+        # not invariant under S^-1 F, so the tangent blocks still couple to it.
+        inverse, _ = lowdin(overlap)
+        span = inverse @ np.linalg.qr(rng.normal(size=(7, 3)) + 1j * rng.normal(size=(7, 3)))[0]
+        _, rotation = eigh(span.conj().T @ fock @ span)
+        joint = span @ rotation
+        initials = [joint[:, :2], joint[:, 2:3]]
+        occupations = ([2, 2, 1],)
+        dt = 3.
+
+        def coordinates(delta):
+            trial = OrbitalState((joint @ (np.eye(3) + delta),), occupations)
+            errors = midpoint_residual(OrbitalState((joint,), occupations), trial, overlap,
+                                       lambda d, t: fock, dt)[0]
+            return -joint.conj().T @ overlap @ errors
+
+        delta = rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3))
+        jacobian = (coordinates(1e-6 * delta) - coordinates(-1e-6 * delta)) / 2e-6
+        self.assertGreater(np.linalg.norm(jacobian + delta), 10 * np.linalg.norm(delta))
+        natives = [propagation._pt_preconditioner(overlap, fock, c, dt / 2) for c in initials]
+        precondition = propagation._midpoint_group_preconditioner(overlap, fock, initials, natives, dt / 2)
+        residual = joint @ jacobian
+        step = np.concatenate(precondition([residual[:, :2], residual[:, 2:]]), axis=1)
+        assert_allclose(step, -joint @ delta, atol=1e-7, rtol=0)
+        # A tangent residual must not leak into the occupied coordinates.
+        tangent = rng.normal(size=(7, 3)) + 1j * rng.normal(size=(7, 3))
+        tangent -= joint @ (joint.conj().T @ overlap @ tangent)
+        residual = residual + tangent
+        step = np.concatenate(precondition([residual[:, :2], residual[:, 2:]]), axis=1)
+        assert_allclose(joint.conj().T @ overlap @ step, -delta, atol=1e-7, rtol=0)
+
+    def test_only_spins_with_several_groups_use_the_joint_block(self):
+        # Closed-shell and unrestricted spins keep the split preconditioner
+        # unchanged, so their steps are those of the single-group scheme.
+        calls = []
+        original = propagation._midpoint_group_preconditioner
+
+        def spy(overlap, hamiltonian, initials, natives, half_dt):
+            calls.append(len(initials))
+            return original(overlap, hamiltonian, initials, natives, half_dt)
+        for name, state, overlap, fock in cases():
+            calls.clear()
+            with self.subTest(case=name), mock.patch.object(propagation, '_midpoint_group_preconditioner', spy):
+                crank_nicolson(state, overlap, fock, 0., .3, options=OPTIONS)
+                crank_nicolson(state, overlap, fock, 0., .3, options=CNOptions('pt_cn', 1e-12, 200))
+                self.assertEqual(calls, [2] if name == 'restricted_2_1' else [])
+
+    def test_two_one_core_pairs_converge_in_few_updates_at_large_alpha_dt(self):
+        # N2 HOMO -> LUMO vertical 2/1 state at alpha*dt = 10, where tau |e_i + e_a|
+        # reaches about 70 for the N 1s pairs. Without the joint occupied
+        # block both steps take 28 updates.
+        mol = gto.M(atom=[('N', (0., 0., -1.1)), ('N', (0., 0., 1.1))], unit='Bohr', basis='sto-3g', verbose=0)
+        mf = dft.RKS(mol, xc='pbe')
+        mf.chkfile, mf.grids.level, mf.grids.prune = None, 1, None
+        mf.conv_tol = 1e-12
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        provider = PySCFProvider(mf)
+        columns = [0, 1, 2, 3, 4, 5, 6, 7]
+        state = OrbitalState((mf.mo_coeff[:, columns] + 0j,), ([2, 2, 2, 2, 2, 2, 1, 1],))
+        for alpha, dt in ((1., 10.), (20., .5)):
+            with self.subTest(alpha=alpha):
+                final, diagnostic = crank_nicolson(state, provider.overlap, provider.fock, 0., dt, alpha=alpha,
+                                                   options=CNOptions('pt_im', 1e-12, 60))
+                self.assertLessEqual(diagnostic.residual, 1e-12)
+                self.assertLess(diagnostic.iterations, 20)
+                self.assertLess(final.orthogonality_error(provider.overlap), 1e-11)
 
 
 class MolecularMidpointTests(unittest.TestCase):

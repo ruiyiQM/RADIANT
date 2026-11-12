@@ -229,6 +229,57 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
     return precondition
 
 
+def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half_dt):
+    """Joint PT-IM preconditioner of one spin with several occupation groups.
+
+    For C = C0 (I + Delta) with the start Fock frozen, the occupied-span
+    coordinates Q = C0^H S R of the midpoint residual have the Jacobian
+    J[Delta] = -Delta - i tau (E Delta + Delta^H E_b - blockdiag(Delta^H E + E Delta)),
+    tau = dt/2, E = C0^H F C0 and E_b its intra-group blocks. Intra-group
+    blocks of J are -Delta. In the eigenbases of the intra-group blocks of E,
+    with the inter-group blocks of E neglected, each pair i in g, a in h
+    couples Delta_ia and conj(Delta_ai) through
+        [[-1 - i tau e_i, -i tau e_a], [i tau e_i, -1 + i tau e_a]],
+    of determinant 1 + i tau (e_i - e_a). The full Gram inverse couples the
+    inter-group non-orthogonality into the rotation with strength
+    tau |e_i + e_a|, which can reach tens for core orbitals. The per-group
+    tangent preconditioners see only energy differences there, so without
+    this block Anderson converges slowly and stalls near the Fock-build
+    noise amplified by that coupling. Q is mapped by -J^-1 and the rest of the
+    residual by the per-group tangent preconditioners, whose output is then
+    S-orthogonalized to the joint initial span.
+    """
+    joint = np.concatenate(initials, axis=1)
+    bounds = np.cumsum([0] + [c.shape[1] for c in initials])
+    blocks = list(zip(bounds[:-1], bounds[1:]))
+    energies = joint.conj().T @ hamiltonian @ joint
+    energies = .5 * (energies + energies.conj().T)
+    bases = [eigh(energies[lo:hi, lo:hi]) for lo, hi in blocks]
+
+    def precondition(residuals):
+        residual = np.concatenate(residuals, axis=1)
+        coordinates = joint.conj().T @ overlap @ residual
+        step = coordinates.copy()
+        for g, (glo, ghi) in enumerate(blocks):
+            for k in range(g + 1, len(blocks)):
+                klo, khi = blocks[k]
+                (eg, ug), (ek, uk) = bases[g], bases[k]
+                ei, ea = eg[:, None], ek[None, :]
+                upper = ug.conj().T @ coordinates[glo:ghi, klo:khi] @ uk
+                lower = (uk.conj().T @ coordinates[klo:khi, glo:ghi] @ ug).T.conj()
+                determinant = 1 + 1j * half_dt * (ei - ea)
+                forward = ((-1 + 1j * half_dt * ea) * upper + 1j * half_dt * ea * lower) / determinant
+                backward = (-1j * half_dt * ei * upper - (1 + 1j * half_dt * ei) * lower) / determinant
+                step[glo:ghi, klo:khi] = -ug @ forward @ uk.conj().T
+                step[klo:khi, glo:ghi] = -uk @ backward.T.conj() @ ug.conj().T
+        tangent = residual - joint @ coordinates
+        tangent = np.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
+        tangent -= joint @ (joint.conj().T @ overlap @ tangent)
+        total = joint @ step + tangent
+        return [total[:, lo:hi] for lo, hi in blocks]
+    return precondition
+
+
 def _midpoint_phi(overlap, metric_factor, hamiltonian, mids):
     """Grouped Gram-inverse PT field phi = S^-1 F M - M G^-1 B of one spin.
 
@@ -305,9 +356,17 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
         half_dt = .5 * dt
         preconditioners = [_pt_preconditioner(overlap, start[s], c, half_dt)
                            for c, s in zip(initial, spins)]
+        joint_preconditioners = {}
         if midpoint:
-            # The midpoint field has no occupied-span Jacobian of the PT-CN
-            # form: leave that component unpreconditioned, treat the rest natively.
+            # Spins with several groups (restricted 2/1) precondition their
+            # occupied span jointly; single-group spins keep the split below.
+            joint_preconditioners = {
+                spin: _midpoint_group_preconditioner(overlap, start[spin], [initial[i] for i in group],
+                                                     [preconditioners[i] for i in group], half_dt)
+                for spin, group in enumerate(members) if len(group) > 1}
+            # With one group the occupied-span Jacobian of the midpoint
+            # residual is -I: leave that component unpreconditioned, treat the
+            # rest natively.
             def split(native, c0):
                 def precondition(r):
                     q = c0 @ (c0.conj().T @ overlap @ r)
@@ -343,8 +402,15 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             if residual <= options.tolerance:
                 break
             current = np.concatenate([c.ravel() for c in blocks])
-            candidate = np.concatenate([(c + precondition(r)).ravel()
-                                        for c, r, precondition in zip(blocks, errors, preconditioners)])
+            steps = [None] * len(blocks)
+            for spin, group in enumerate(members):
+                if spin in joint_preconditioners:
+                    for i, step in zip(group, joint_preconditioners[spin]([errors[i] for i in group])):
+                        steps[i] = step
+                else:
+                    for i in group:
+                        steps[i] = preconditioners[i](errors[i])
+            candidate = np.concatenate([(c + step).ravel() for c, step in zip(blocks, steps)])
             # Scale the Tikhonov term with the update for every block count: a
             # fixed value swamps the shrinking history near convergence, which
             # turns Anderson off and stalls large alpha*dt steps.
