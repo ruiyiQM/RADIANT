@@ -229,11 +229,20 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
     return precondition
 
 
+# PT-IM preconditions in the initial frame until the residual falls below
+# this fraction of the first one, then in the midpoint frame of the iterate.
+# Following the midpoint frame from the first update converged to a different
+# root of the midpoint rule for a large step (N2 test at dt = 40).
+_MIDPOINT_FRAME_SWITCH = 1e-2
+
+
 def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half_dt):
     """Joint PT-IM preconditioner of one spin with several occupation groups.
 
-    For C = C0 (I + Delta) with the start Fock frozen, the occupied-span
-    coordinates Q = C0^H S R of the midpoint residual have the Jacobian
+    C0 is the S-orthonormal frame of the groups (the caller passes the
+    midpoint frame of the current iterate). For C = C0 (I + Delta) with the
+    start Fock frozen, the occupied-span coordinates Q = C0^H S R of the
+    midpoint residual have the Jacobian
     J[Delta] = -Delta - i tau (E Delta + Delta^H E_b - blockdiag(Delta^H E + E Delta)),
     tau = dt/2, E = C0^H F C0 and E_b its intra-group blocks. Intra-group
     blocks of J are -Delta. In the eigenbases of the intra-group blocks of E,
@@ -247,7 +256,7 @@ def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half
     this block Anderson converges slowly and stalls near the Fock-build
     noise amplified by that coupling. Q is mapped by -J^-1 and the rest of the
     residual by the per-group tangent preconditioners, whose output is then
-    S-orthogonalized to the joint initial span.
+    S-orthogonalized to the joint frame.
     """
     joint = np.concatenate(initials, axis=1)
     bounds = np.cumsum([0] + [c.shape[1] for c in initials])
@@ -314,7 +323,10 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     implicit midpoint rule C1 - C0 + i dt phi(M) = 0 with M = (C0 + C1)/2,
     the Fock of D_M = sum_g f_g M_g M_g^H at time + dt/2 and the grouped field
     of _midpoint_phi. Its root keeps the Gram up to the solver tolerance and
-    only that defect is removed before returning.
+    only that defect is removed before returning. PT-IM preconditions in the
+    initial frame until the residual has fallen by _MIDPOINT_FRAME_SWITCH,
+    then in the S-orthonormalized midpoint frame of the current iterate,
+    rebuilt every iteration with the start Fock (see midpoint_steps).
 
     The implicit midpoint rule for PT dynamics was proposed by An and Lin,
     Multiscale Model. Simul. 18, 612 (2020), arXiv:1804.02095. With one group
@@ -354,26 +366,50 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
 
         start = evaluate(state, time)
         half_dt = .5 * dt
-        preconditioners = [_pt_preconditioner(overlap, start[s], c, half_dt)
-                           for c, s in zip(initial, spins)]
-        joint_preconditioners = {}
         if midpoint:
-            # Spins with several groups (restricted 2/1) precondition their
-            # occupied span jointly; single-group spins keep the split below.
-            joint_preconditioners = {
-                spin: _midpoint_group_preconditioner(overlap, start[spin], [initial[i] for i in group],
-                                                     [preconditioners[i] for i in group], half_dt)
-                for spin, group in enumerate(members) if len(group) > 1}
-            # With one group the occupied-span Jacobian of the midpoint
-            # residual is -I: leave that component unpreconditioned, treat the
-            # rest natively.
-            def split(native, c0):
+            # With one group the Jacobian of the midpoint residual on the
+            # midpoint span is close to -I: leave that component
+            # unpreconditioned and treat the rest natively.
+            def split(native, frame):
                 def precondition(r):
-                    q = c0 @ (c0.conj().T @ overlap @ r)
+                    q = frame @ (frame.conj().T @ overlap @ r)
                     p = native(r - q)
-                    return q + p - c0 @ (c0.conj().T @ overlap @ p)
+                    return q + p - frame @ (frame.conj().T @ overlap @ p)
                 return precondition
-            preconditioners = [split(native, c0) for native, c0 in zip(preconditioners, initial)]
+
+            def midpoint_steps(parts, errors):
+                # The split follows the S-orthonormalized midpoint span of the
+                # current iterate, with the start Fock. A split fixed at C0
+                # misplaces the part of the midpoint span that has left the
+                # initial span, about 1 - g_min of it (g_min the smallest
+                # midpoint Gram eigenvalue), and the tangent block scales that
+                # error by tau |e_core|: 40 at dt = 90 for Cl 1s in NaCl.
+                frames = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
+                for group in members:
+                    joint = np.concatenate([frames[i] for i in group], axis=1)
+                    if not joint.shape[1]:
+                        continue
+                    values, vectors = eigh(joint.conj().T @ overlap @ joint)
+                    if values[0] <= 1e-8:
+                        joint = np.concatenate([initial[i] for i in group], axis=1)
+                    else:
+                        joint = joint @ ((vectors * values**-.5) @ vectors.conj().T)
+                    bounds = np.cumsum([0] + [initial[i].shape[1] for i in group])
+                    for k, i in enumerate(group):
+                        frames[i] = joint[:, bounds[k]:bounds[k + 1]]
+                natives = [_pt_preconditioner(overlap, start[s], f, half_dt) for f, s in zip(frames, spins)]
+                steps = [None] * len(parts)
+                for spin, group in enumerate(members):
+                    if len(group) > 1:
+                        # Restricted 2/1: precondition the occupied span jointly.
+                        joint = _midpoint_group_preconditioner(overlap, start[spin], [frames[i] for i in group],
+                                                               [natives[i] for i in group], half_dt)
+                        for i, step in zip(group, joint([errors[i] for i in group])):
+                            steps[i] = step
+                    else:
+                        for i in group:
+                            steps[i] = split(natives[i], frames[i])(errors[i])
+                return steps
 
             def errors_of(parts, iteration):
                 mids = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
@@ -386,6 +422,8 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                             errors[i] = initial[i] - parts[i] - 1j * dt * phi
                 return errors
         else:
+            preconditioners = [_pt_preconditioner(overlap, start[s], c, half_dt)
+                               for c, s in zip(initial, spins)]
             rhs = [c - 1j * half_dt * action(c, start[s]) for c, s in zip(initial, spins)]
 
             def errors_of(parts, iteration):
@@ -394,22 +432,23 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                         for r, c, s in zip(rhs, parts, spins)]
 
         accelerator = AndersonAcceleration(history_size=options.history, regularization=1e-12)
+        first, follow = None, False
         for iteration in range(1, options.max_iterations + 1):
             errors = errors_of(blocks, iteration)
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
+            first = residual if first is None else first
             if not np.isfinite(residual):
                 raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
             if residual <= options.tolerance:
                 break
             current = np.concatenate([c.ravel() for c in blocks])
-            steps = [None] * len(blocks)
-            for spin, group in enumerate(members):
-                if spin in joint_preconditioners:
-                    for i, step in zip(group, joint_preconditioners[spin]([errors[i] for i in group])):
-                        steps[i] = step
-                else:
-                    for i in group:
-                        steps[i] = preconditioners[i](errors[i])
+            if midpoint:
+                # The preconditioner changes with the iterate; Anderson mixing
+                # tolerated this better than periodic rebuilds with a history reset.
+                follow = follow or residual <= _MIDPOINT_FRAME_SWITCH * first
+                steps = midpoint_steps(blocks if follow else initial, errors)
+            else:
+                steps = [precondition(r) for r, precondition in zip(errors, preconditioners)]
             candidate = np.concatenate([(c + step).ravel() for c, step in zip(blocks, steps)])
             # Scale the Tikhonov term with the update for every block count: a
             # fixed value swamps the shrinking history near convergence, which

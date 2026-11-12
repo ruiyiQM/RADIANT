@@ -288,7 +288,7 @@ class GroupPreconditionerTests(unittest.TestCase):
             with self.subTest(case=name), mock.patch.object(propagation, '_midpoint_group_preconditioner', spy):
                 crank_nicolson(state, overlap, fock, 0., .3, options=OPTIONS)
                 crank_nicolson(state, overlap, fock, 0., .3, options=CNOptions('pt_cn', 1e-12, 200))
-                self.assertEqual(calls, [2] if name == 'restricted_2_1' else [])
+                self.assertEqual(set(calls), {2} if name == 'restricted_2_1' else set())
 
     def test_two_one_core_pairs_converge_in_few_updates_at_large_alpha_dt(self):
         # N2 HOMO -> LUMO vertical 2/1 state at alpha*dt = 10, where tau |e_i + e_a|
@@ -310,6 +310,53 @@ class GroupPreconditionerTests(unittest.TestCase):
                 self.assertLessEqual(diagnostic.residual, 1e-12)
                 self.assertLess(diagnostic.iterations, 20)
                 self.assertLess(final.orthogonality_error(provider.overlap), 1e-11)
+
+
+def rotated_closed_shell(atoms, theta):
+    """Closed-shell sto-3g PBE state whose HOMO is rotated by theta into the LUMO."""
+    mol = gto.M(atom=atoms, unit='Bohr', basis='sto-3g', verbose=0)
+    mf = dft.RKS(mol, xc='pbe')
+    mf.chkfile, mf.grids.level, mf.grids.prune = None, 1, None
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    assert mf.converged
+    occupied = int(np.sum(mf.mo_occ > 0))
+    c = mf.mo_coeff[:, :occupied].astype(complex)
+    c[:, -1] = np.cos(theta) * mf.mo_coeff[:, occupied - 1] + np.sin(theta) * mf.mo_coeff[:, occupied]
+    return PySCFProvider(mf), OrbitalState((c,), (np.full(occupied, 2.),))
+
+
+def midpoint_gram_minimum(state, final, overlap):
+    m = .5 * (state.coefficients[0] + final.coefficients[0])
+    return np.linalg.eigvalsh(m.conj().T @ overlap @ m)[0]
+
+
+class MidpointFrameTests(unittest.TestCase):
+    def test_closed_shell_core_converges_in_few_updates_at_large_dt(self):
+        # At large dt the midpoint span leaves the initial span by about
+        # 1 - g_min (g_min the smallest midpoint Gram eigenvalue). A split
+        # fixed at C0 lets tau |e_core| amplify that error: Cl 1s is near
+        # -100 Ha. With that split these steps take 90 and 142 updates.
+        provider, state = rotated_closed_shell([('H', (0., 0., -1.3)), ('Cl', (0., 0., 1.1))], .3)
+        for dt in (20., 40.):
+            with self.subTest(dt=dt):
+                final, diagnostic = crank_nicolson(state, provider.overlap, provider.fock, 0., dt,
+                                                   options=CNOptions('pt_im', 1e-10, 200))
+                self.assertLessEqual(diagnostic.residual, 1e-10)
+                self.assertLess(diagnostic.iterations, 70)
+                self.assertGreater(midpoint_gram_minimum(state, final, provider.overlap), .9)
+
+    def test_large_step_keeps_the_root_continued_from_small_dt(self):
+        # The midpoint rule has further roots at large dt. Continuing the root
+        # from dt = 2 in steps of 2 gives g_min = 0.685 at dt = 40; following
+        # the midpoint frame from the first update instead reaches a root with
+        # g_min = 0.28. The initial frame is kept until the residual has
+        # fallen by _MIDPOINT_FRAME_SWITCH.
+        provider, state = rotated_closed_shell([('N', (0., 0., -1.1)), ('N', (0., 0., 1.1))], .6)
+        final, diagnostic = crank_nicolson(state, provider.overlap, provider.fock, 0., 40.,
+                                           options=CNOptions('pt_im', 1e-10, 300))
+        self.assertLessEqual(diagnostic.residual, 1e-10)
+        self.assertAlmostEqual(midpoint_gram_minimum(state, final, provider.overlap), .685, delta=.005)
 
 
 class MolecularMidpointTests(unittest.TestCase):
