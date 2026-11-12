@@ -50,16 +50,15 @@ class CNOptions:
     variant: str = "cn_accelerated"
     tolerance: float = 1e-9
     max_iterations: int = 80
-    # Anderson history of the PT solvers; None keeps 6 for pt_cn (its
-    # published behaviour) and uses 20 for pt_im.
-    history: int | None = None
+    # Anderson history of the PT solvers (pt_cn and pt_im).
+    history: int = 20
 
     def __post_init__(self):
         if self.variant not in ("cn", "cn_accelerated", "pt_cn", "pt_im"):
             raise ValueError("Supported propagators: cn, cn_accelerated, pt_cn, pt_im")
-        if self.history is not None and (not isinstance(self.history, int)
-                                         or isinstance(self.history, bool) or self.history < 1):
-            raise ValueError("history must be a positive integer or None")
+        if (not isinstance(self.history, int) or isinstance(self.history, bool)
+                or self.history < 1):
+            raise ValueError("history must be a positive integer")
         if not np.isfinite(self.tolerance) or self.tolerance <= 0:
             raise ValueError("Tolerance must be finite and positive")
         if (not isinstance(self.max_iterations, int) or isinstance(self.max_iterations, bool)
@@ -265,7 +264,6 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     """
     midpoint = options.variant == "pt_im"
     label = "PT-IM" if midpoint else "PT-CN"
-    history = options.history if options.history is not None else (20 if midpoint else 6)
     groups = _occupation_groups(state)
     spins = [spin for spin, _ in groups]
     members = [[i for i, s in enumerate(spins) if s == spin]
@@ -321,7 +319,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 return [r - c - 1j * half_dt * action(c, final[s])
                         for r, c, s in zip(rhs, parts, spins)]
 
-        accelerator = AndersonAcceleration(history_size=history, regularization=1e-12)
+        accelerator = AndersonAcceleration(history_size=options.history, regularization=1e-12)
         for iteration in range(1, options.max_iterations + 1):
             errors = errors_of(blocks, iteration)
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))

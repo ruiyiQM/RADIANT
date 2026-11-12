@@ -46,6 +46,8 @@ from toy_provider import ToyProvider
 
 
 OPTIONS = CNOptions('pt_cn', 1e-12, 120)
+# The frozen source mixed with an Anderson history of 6; its fixture pins that path.
+SOURCE_OPTIONS = CNOptions('pt_cn', 1e-12, 120, 6)
 FIXTURE = json.loads((Path(__file__).parent/'fixtures'/'pt_cn.json').read_text())
 
 
@@ -74,7 +76,7 @@ class PTCNTests(unittest.TestCase):
             with self.subTest(case=case['name']):
                 initial, overlap, fock = model(case)
                 final, diagnostic = crank_nicolson(initial, overlap, fock, 0., case['dt'],
-                                                   alpha=case['alpha'], options=OPTIONS)
+                                                   alpha=case['alpha'], options=SOURCE_OPTIONS)
                 for actual, expected in zip(final.coefficients, case['final']):
                     assert_allclose(actual, decode(expected), atol=1e-12, rtol=0)
                 self.assertLessEqual(diagnostic.residual, OPTIONS.tolerance)

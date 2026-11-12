@@ -28,7 +28,7 @@ def run_toml(path):
         "system": {"atoms", "unit", "charge", "spin", "masses", "momenta"},
         "backend": {"model", "basis", "xc", "density_convention"},
         "state": {"initial", "alpha"},
-        "propagation": {"variant", "tolerance", "max_iterations"},
+        "propagation": {"variant", "tolerance", "max_iterations", "history"},
         "trajectory": {"dt", "steps", "n_substeps"},
         "output": {"file"},
     }

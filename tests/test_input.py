@@ -41,10 +41,13 @@ file = "trajectory.npz"
 
 class InputTests(unittest.TestCase):
     def test_toml_runs_and_writes_only_in_its_output_directory(self):
-        for variant in ("cn_accelerated", "pt_cn"):
+        for variant in ("cn_accelerated", "pt_cn", "pt_im"):
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder)
-                path=root/"input.toml"; path.write_text(INPUT.replace("cn_accelerated", variant))
+                text=INPUT.replace("cn_accelerated", variant)
+                if variant.startswith("pt"):
+                    text=text.replace("max_iterations = 80","max_iterations = 80\nhistory = 8")
+                path=root/"input.toml"; path.write_text(text)
                 run=run_toml(path)
                 self.assertEqual(run.time,.2)
                 self.assertEqual(len(run.frames),2)
