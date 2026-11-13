@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Ruiyi Zhou
-"""Grouped Gram-inverse parallel-transport implicit midpoint (PT-IM).
+"""Parallel-transport implicit midpoint (PT-IM).
 
-With M = (C0 + C1)/2, G = M^H S M and B = blockdiag_g(M_g^H F M_g), the step
-solves C1 - C0 + i dt (S^-1 F[D_M] M - M G^-1 B) = 0 with the unnormalized
-midpoint density D_M = sum_g f_g M_g M_g^H. Because B and G are Hermitian the
-root keeps the full Gram, including the orthogonality between the doubly and
-singly occupied groups, so no projection follows the solve.
+With M = (C0 + C1)/2, the step solves C1 - C0 + i dt phi(M) = 0. For one
+occupation group per spin, with G = M^H S M and B = M^H F M,
+phi = S^-1 F[D_M] M - M G^-1 B with the unnormalized midpoint density
+D_M = f M M^H. A restricted 2/1 spin uses the hamc field, the gradient of
+H(Cb) = E[Cb p(Gb) Cb^H] with Cb = M diag(f)^(1/2), Gb = Cb^H S Cb and
+p = f_c / x on each occupation cluster of Gb. Both roots keep the full Gram,
+including the orthogonality between the doubly and singly occupied groups,
+so no projection follows the solve.
 """
 
 from copy import deepcopy
@@ -16,7 +19,7 @@ import numpy as np
 from numpy.testing import assert_allclose
 from pyscf import dft, gto
 from scipy.integrate import solve_ivp
-from scipy.linalg import eigh, expm
+from scipy.linalg import cho_factor, eigh, expm, null_space
 from scipy.optimize import root
 
 from radiant.backends.pyscf import PySCFProvider
@@ -63,8 +66,44 @@ def cases():
             ('unrestricted', *unrestricted_case())]
 
 
-def midpoint_residual(state, trial, overlap, fock, dt):
-    """Independent PT-IM residual written from the defining equation."""
+def two_one_projector(m, f, overlap):
+    """Cb, Gb^-1 and the spectral projector of Gb onto its n_1 smallest eigenvalues."""
+    cb = m * np.sqrt(f)
+    gb = cb.conj().T @ overlap @ cb
+    values, vectors = eigh(gb)
+    lower = vectors[:, :np.count_nonzero(f == 1)]
+    return cb, np.linalg.inv(gb), lower @ lower.conj().T, values, vectors
+
+
+def hamc_density(m, f, overlap):
+    """Fock density Cb p(Gb) Cb^H with p(Gb) = (2 I - P_1) Gb^-1."""
+    cb, inverse, p1, _, _ = two_one_projector(m, f, overlap)
+    return cb @ ((2 * np.eye(len(f)) - p1) @ inverse) @ cb.conj().T
+
+
+def hamc_field(m, f, overlap, h):
+    """Independent hamc field: S phi R = F Cb p(Gb) + S Cb Dp(Gb)[Cb^H F Cb].
+
+    p(X) = (2 I - P_1(X)) X^-1, so Dp[K] = -DP_1[K] X^-1 - p(X) K X^-1, with
+    the first-order perturbation of the spectral projector P_1.
+    """
+    cb, inverse, p1, values, vectors = two_one_projector(m, f, overlap)
+    n1 = np.count_nonzero(f == 1)
+    k = cb.conj().T @ h @ cb
+    low, high = vectors[:, :n1], vectors[:, n1:]
+    weight = 1. / (values[:n1, None] - values[None, n1:])
+    coupling = low @ (weight * (low.conj().T @ k @ high)) @ high.conj().T
+    dp1 = coupling + coupling.conj().T
+    p = (2 * np.eye(len(f)) - p1) @ inverse
+    dp = -dp1 @ inverse - p @ k @ inverse
+    return (np.linalg.solve(overlap, h @ cb @ p) + cb @ dp) / np.sqrt(f)
+
+
+def grouped_midpoint_residual(state, trial, overlap, fock, dt):
+    """Residual of the grouped field S^-1 F M - M G^-1 blockdiag_g(M_g^H F M_g).
+
+    PT-IM uses it for one group per spin; for 2/1 it is the first solver phase.
+    """
     mids = [.5 * (a + b) for a, b in zip(state.coefficients, trial.coefficients)]
     value = np.asarray(fock(OrbitalState(tuple(mids), state.occupations).density(), dt / 2))
     focks = value[None] if value.ndim == 2 else value
@@ -77,6 +116,79 @@ def midpoint_residual(state, trial, overlap, fock, dt):
         phi = np.linalg.solve(overlap, h @ m) - m @ np.linalg.solve(m.conj().T @ overlap @ m, gauge)
         errors.append(c1 - c0 + 1j * dt * phi)
     return errors
+
+
+def midpoint_residual(state, trial, overlap, fock, dt):
+    """Independent PT-IM residual written from the defining equation."""
+    mids = [.5 * (a + b) for a, b in zip(state.coefficients, trial.coefficients)]
+    occupations = [np.asarray(f, float) for f in state.occupations]
+    two_one = len(mids) == 1 and len(np.unique(occupations[0])) > 1
+    density = (hamc_density(mids[0], occupations[0], overlap) if two_one
+               else OrbitalState(tuple(mids), state.occupations).density())
+    value = np.asarray(fock(density, dt / 2))
+    focks = value[None] if value.ndim == 2 else value
+    errors = []
+    for m, c0, c1, f, h in zip(mids, state.coefficients, trial.coefficients, occupations, focks):
+        if two_one:
+            phi = hamc_field(m, f, overlap, h)
+        else:
+            phi = (np.linalg.solve(overlap, h @ m)
+                   - m @ np.linalg.solve(m.conj().T @ overlap @ m, m.conj().T @ h @ m))
+        errors.append(c1 - c0 + 1j * dt * phi)
+    return errors
+
+
+def tangent_symplectic_defect(state, overlap, fock, dt, options, eps=1e-4):
+    """|(D Phi T)^T Om (D Phi T) - T^T Om T| / |T^T Om T| of one restricted step.
+
+    Om(u, v) = Im tr(u^H S v) in Cb = C diag(f)^(1/2). T spans the tangent
+    space of Cb^H S Cb = diag(f) at the state, D Phi T is the central
+    difference of the step along Loewdin-retracted directions.
+    """
+    c0 = state.coefficients[0]
+    root = np.sqrt(np.asarray(state.occupations[0], float))
+    cb0 = c0 * root
+    size = c0.size
+
+    def complex_of(x):
+        return (x[:size] + 1j * x[size:]).reshape(c0.shape)
+
+    def real_of(z):
+        return np.concatenate([z.real.ravel(), z.imag.ravel()])
+
+    def gram_change(x):
+        q = cb0.conj().T @ overlap @ complex_of(x)
+        return real_of(q + q.conj().T)
+    tangent = null_space(np.array([gram_change(e) for e in np.eye(2 * size)]).T)
+    metric = np.kron(overlap, np.eye(c0.shape[1]))
+    omega = np.block([[np.zeros_like(metric), metric], [-metric, np.zeros_like(metric)]])
+    columns = []
+    for k in range(tangent.shape[1]):
+        direction = complex_of(tangent[:, k]) / root
+        ends = []
+        for sign in (1., -1.):
+            c = c0 + sign * eps * direction
+            values, vectors = eigh(c.conj().T @ overlap @ c)
+            c = c @ ((vectors * values**-.5) @ vectors.conj().T)
+            final, _ = crank_nicolson(OrbitalState((c,), state.occupations), overlap, fock, 0., dt,
+                                      options=options)
+            ends.append(real_of(final.coefficients[0] * root))
+        columns.append((ends[0] - ends[1]) / (2 * eps))
+    image = np.array(columns).T
+    reference = tangent.T @ omega @ tangent
+    return np.abs(image.T @ omega @ image - reference).max() / np.abs(reference).max()
+
+
+def gradient_fock(overlap, core):
+    """Nonlinear Fock F = dE/dD of E = tr(h D) + .05 tr(SDSD) + .01 tr(SDSD)^2."""
+    def energy(density):
+        quadratic = np.trace(overlap @ density @ overlap @ density).real
+        return np.trace(core @ density).real + .05 * quadratic + .01 * quadratic**2
+
+    def fock(density, time):
+        quadratic = np.trace(overlap @ density @ overlap @ density).real
+        return core + (.1 + .04 * quadratic) * overlap @ density @ overlap
+    return energy, fock
 
 
 class GroupedMidpointTests(unittest.TestCase):
@@ -255,8 +367,8 @@ class GroupPreconditionerTests(unittest.TestCase):
 
         def coordinates(delta):
             trial = OrbitalState((joint @ (np.eye(3) + delta),), occupations)
-            errors = midpoint_residual(OrbitalState((joint,), occupations), trial, overlap,
-                                       lambda d, t: fock, dt)[0]
+            errors = grouped_midpoint_residual(OrbitalState((joint,), occupations), trial, overlap,
+                                               lambda d, t: fock, dt)[0]
             return -joint.conj().T @ overlap @ errors
 
         delta = rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3))
@@ -310,6 +422,145 @@ class GroupPreconditionerTests(unittest.TestCase):
                 self.assertLessEqual(diagnostic.residual, 1e-12)
                 self.assertLess(diagnostic.iterations, 20)
                 self.assertLess(final.orthogonality_error(provider.overlap), 1e-11)
+
+
+class HamiltonianTwoOneTests(unittest.TestCase):
+    def test_hamc_field_is_the_gradient_of_the_modified_energy(self):
+        state, overlap, core = random_model()
+        energy, fock = gradient_fock(overlap, core)
+        rng = np.random.default_rng(5)
+        f = np.asarray(state.occupations[0], float)
+        c = state.coefficients[0]
+        groups = [np.flatnonzero(f == 2), np.flatnonzero(f == 1)]
+
+        def field(m):
+            orbitals, data = propagation._hamc_fock_orbitals(overlap, [m[:, g] for g in groups],
+                                                             [f[g] for g in groups])
+            density = sum(f[g][0] * x @ x.conj().T for x, g in zip(orbitals, groups))
+            assert_allclose(density, hamc_density(m, f, overlap), atol=1e-13, rtol=0)
+            h = fock(density, 0.)
+            phi = np.empty_like(m)
+            for g, part in zip(groups, propagation._hamc_phi(overlap, cho_factor(overlap), h, data)):
+                phi[:, g] = part
+            assert_allclose(phi, hamc_field(m, f, overlap, h), atol=1e-12, rtol=0)
+            return phi, h
+        # On the Gram constraint the hamc field is the grouped PT field.
+        phi, h = field(c)
+        grouped = propagation._midpoint_phi(overlap, cho_factor(overlap), h, [c[:, g] for g in groups])
+        assert_allclose(phi, np.concatenate(grouped, axis=1), atol=1e-12, rtol=0)
+        # Off the constraint, as at a midpoint, it is the gradient of the
+        # modified energy: dH = 2 Re tr(dM^H S phi diag(f)).
+        m = c + .1 * (rng.normal(size=c.shape) + 1j * rng.normal(size=c.shape))
+        phi, _ = field(m)
+        for k in range(3):
+            direction = rng.normal(size=c.shape) + 1j * rng.normal(size=c.shape)
+            numerical = (energy(hamc_density(m + 1e-5 * direction, f, overlap))
+                         - energy(hamc_density(m - 1e-5 * direction, f, overlap))) / 2e-5
+            analytic = 2 * np.trace(direction.conj().T @ overlap @ (phi * f)).real
+            self.assertAlmostEqual(analytic / numerical, 1., delta=1e-7)
+
+    def test_two_one_step_is_symplectic_and_single_group_step_is_not(self):
+        state, overlap, core = random_model()
+        _, fock = gradient_fock(overlap, core)
+        options = CNOptions('pt_im', 1e-12, 300)
+        for dt in (.5, 1.):
+            with self.subTest(dt=dt):
+                self.assertLess(tangent_symplectic_defect(state, overlap, fock, dt, options), 1e-7)
+        # The single-group PT-IM integrates the non-Hamiltonian PT field (An
+        # and Lin), so the same measure detects a defect there.
+        closed = OrbitalState((state.coefficients[0][:, :2],), ([2, 2],))
+        self.assertGreater(tangent_symplectic_defect(closed, overlap, fock, .5, options), 1e-2)
+
+    def test_two_one_root_does_not_depend_on_the_energy_zero(self):
+        state, overlap, core = random_model()
+        fock = mean_field_fock(overlap, core)
+        final, _ = crank_nicolson(state, overlap, fock, 0., .5, options=OPTIONS)
+        shifted, _ = crank_nicolson(state, overlap, lambda d, t: fock(d, t) + 10. * overlap, 0., .5,
+                                    options=OPTIONS)
+        assert_allclose(shifted.coefficients[0], final.coefficients[0], atol=1e-11, rtol=0)
+        # At this midpoint the grouped field would gain 10 M G^-1 G_inter.
+        m = .5 * (state.coefficients[0] + final.coefficients[0])
+        gained = propagation._midpoint_phi(overlap, cho_factor(overlap), 10. * overlap, [m[:, :2], m[:, 2:]])
+        self.assertGreater(np.linalg.norm(np.concatenate(gained, axis=1)), 1e-3)
+
+    def test_exact_occupied_block_inverts_the_hamc_jacobian(self):
+        # As the closed-form test of _midpoint_group_preconditioner, but E has
+        # inter-group blocks, which the closed-form pairs neglect.
+        rng = np.random.default_rng(11)
+        b = rng.normal(size=(7, 7))
+        overlap = np.eye(7) + .2 * b @ b.T / 7
+        a = rng.normal(size=(7, 7)) + 1j * rng.normal(size=(7, 7))
+        fock = .5 * (a + a.conj().T) - 12. * overlap
+        inverse, _ = lowdin(overlap)
+        joint = inverse @ np.linalg.qr(rng.normal(size=(7, 3)) + 1j * rng.normal(size=(7, 3)))[0]
+        initials = [joint[:, :2], joint[:, 2:3]]
+        occupations = ([2, 2, 1],)
+        dt = 3.
+
+        def coordinates(delta):
+            trial = OrbitalState((joint @ (np.eye(3) + delta),), occupations)
+            errors = midpoint_residual(OrbitalState((joint,), occupations), trial, overlap,
+                                       lambda d, t: fock, dt)[0]
+            return -joint.conj().T @ overlap @ errors
+
+        delta = rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3))
+        jacobian = (coordinates(1e-6 * delta) - coordinates(-1e-6 * delta)) / 2e-6
+        natives = [propagation._pt_preconditioner(overlap, fock, c, dt / 2) for c in initials]
+        residual = joint @ jacobian
+        exact = propagation._hamc_group_preconditioner(overlap, fock, initials, natives, dt, [2., 1.])
+        step = np.concatenate(exact([residual[:, :2], residual[:, 2:]]), axis=1)
+        assert_allclose(step, -joint @ delta, atol=1e-7, rtol=0)
+        closed_form = propagation._midpoint_group_preconditioner(overlap, fock, initials, natives, dt / 2)
+        step = np.concatenate(closed_form([residual[:, :2], residual[:, 2:]]), axis=1)
+        self.assertGreater(np.abs(step + joint @ delta).max(), .1)
+
+    def test_exact_block_only_near_the_gram_constraint_and_for_small_blocks(self):
+        state, overlap, core = random_model()
+        fock = mean_field_fock(overlap, core)
+        calls = []
+        original = propagation._hamc_group_preconditioner
+
+        def spy(*args):
+            calls.append(len(args[2]))
+            return original(*args)
+        with mock.patch.object(propagation, '_hamc_group_preconditioner', spy):
+            exact, _ = crank_nicolson(state, overlap, fock, 0., .1, options=OPTIONS)
+            self.assertTrue(calls)
+            calls.clear()
+            with mock.patch.object(propagation, '_HAMC_EXACT_MAX_ORBITALS', 3):
+                closed_form, _ = crank_nicolson(state, overlap, fock, 0., .1, options=OPTIONS)
+            self.assertFalse(calls)
+            # At dt = 2 the smallest midpoint Gram eigenvalue is about 0.35.
+            final, _ = crank_nicolson(state, overlap, fock, 0., 2., options=CNOptions('pt_im', 1e-10, 300))
+            self.assertLess(midpoint_gram_minimum(state, final, overlap), propagation._HAMC_EXACT_GRAM)
+            self.assertFalse(calls)
+        assert_allclose(closed_form.coefficients[0], exact.coefficients[0], atol=1e-11, rtol=0)
+
+    def test_strongly_rotated_two_one_states_converge_at_large_dt(self):
+        # The random 2/1 states are far from stationary. The exact occupied
+        # block, linearized at Gb = diag(f), diverged here.
+        state, overlap, core = random_model()
+        for name, fock in (('mean_field', mean_field_fock(overlap, core)),
+                           ('gradient', gradient_fock(overlap, core)[1])):
+            with self.subTest(fock=name):
+                final, diagnostic = crank_nicolson(state, overlap, fock, 0., 2.,
+                                                   options=CNOptions('pt_im', 1e-10, 300))
+                self.assertLessEqual(diagnostic.residual, 1e-10)
+                self.assertLess(np.abs(midpoint_residual(state, final, overlap, fock, 2.)[0]).max(), 1e-9)
+
+    def test_single_group_spins_never_use_the_hamc_field(self):
+        calls = []
+        original = propagation._hamc_fock_orbitals
+
+        def spy(overlap, mids, occupations):
+            calls.append(len(mids))
+            return original(overlap, mids, occupations)
+        for name, state, overlap, fock in cases():
+            calls.clear()
+            with self.subTest(case=name), mock.patch.object(propagation, '_hamc_fock_orbitals', spy):
+                crank_nicolson(state, overlap, fock, 0., .3, options=OPTIONS)
+                crank_nicolson(state, overlap, fock, 0., .3, options=CNOptions('pt_cn', 1e-12, 200))
+                self.assertEqual(set(calls), {2} if name == 'restricted_2_1' else set())
 
 
 def rotated_closed_shell(atoms, theta):

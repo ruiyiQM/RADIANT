@@ -24,7 +24,8 @@
 """Self-consistent orbital CN and occupied-subspace PT-CN and PT-IM.
 
 Orbital CN follows TDMASH v0.1.0; PT-CN follows frozen d448adb PT.py.
-PT-IM is the implicit midpoint rule of the PT dynamics (references in
+PT-IM is the implicit midpoint rule of the PT dynamics, and for restricted
+2/1 spins of a modified Hamiltonian form of it (references in
 _parallel_transport).
 An unconverged candidate is never returned as an accepted state.
 """
@@ -311,6 +312,146 @@ def _midpoint_phi(overlap, metric_factor, hamiltonian, mids):
     return [phi[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]
 
 
+# Restricted 2/1 PT-IM iterates on the grouped residual of _midpoint_phi until
+# it has fallen by this factor, then on the hamc residual (see
+# _parallel_transport). Cold starts on the hamc residual left the convergence
+# region for strongly rotated 2/1 states at large dt; switching at 1e-1 or
+# 1e-2 also failed on model states.
+_HAMC_SWITCH = 1e-3
+# After the switch the occupied span of a 2/1 spin is preconditioned by the
+# exact frozen-Fock inverse of the hamc Jacobian at Gb = diag(f)
+# (_hamc_group_preconditioner) while the smallest eigenvalue of the midpoint
+# Gram is at least _HAMC_EXACT_GRAM. Molecular 2/1 steps up to dt = 20 had
+# g_min >= 0.98. There it took N2 at alpha dt = 10 from 24-46 iterations to
+# 12, and M1 steps (N = 9, cheap Fock) from 19-45 to 18-38 at 1.5-2.2 times
+# the solver CPU. Random 2/1 states at dt = 1.5-2 have g_min 0.35-0.41,
+# where it failed or needed up to 5 times the iterations of the closed-form
+# block; the threshold lies between the two.
+_HAMC_EXACT_GRAM = .9
+# Largest occupied block for that preconditioner. Its dense real LU over
+# 2 N^2 unknowns is rebuilt every iteration and grows as N^6: 0.27 s at
+# N = 24 and 1 s at N = 32 on one thread. Larger blocks keep
+# _midpoint_group_preconditioner.
+_HAMC_EXACT_MAX_ORBITALS = 24
+
+
+def _hamc_fock_orbitals(overlap, mids, occupations):
+    """Fock orbitals and field data of the hamc energy of one 2/1 spin.
+
+    With R = diag(f)^(1/2), Cb = M R and Gb = Cb^H S Cb = V diag(lam) V^H,
+    p(Gb) takes the value f_c / lam on the eigenvalues of the cluster of
+    occupation f_c. Clusters are assigned by count: the n_1 smallest
+    eigenvalues belong to f = 1, the others to f = 2. The returned orbitals X
+    carry the Fock density sum_g f_g X_g X_g^H = Cb p(Gb) Cb^H, the midpoint
+    orbitals Loewdin-normalized within each cluster.
+    """
+    f = np.concatenate(occupations)
+    root = np.sqrt(f)
+    jb = np.concatenate(mids, axis=1) * root
+    lam, vectors = eigh(jb.conj().T @ overlap @ jb)
+    fc = np.sort(f)
+    pv = fc / lam
+    bounds = np.cumsum([0] + [m.shape[1] for m in mids])
+    x = (jb @ ((vectors * np.sqrt(pv)) @ vectors.conj().T)) / root
+    return ([x[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])],
+            (root, jb, lam, vectors, fc, pv, bounds))
+
+
+def _hamc_phi(overlap, metric_factor, hamiltonian, data):
+    """hamc field of one 2/1 spin; hamiltonian is the Fock of _hamc_fock_orbitals.
+
+    The field is the gradient of H(Cb) = E[Cb p(Gb) Cb^H]:
+    S phi R = F Cb p(Gb) + S Cb Dp(Gb)[Cb^H F Cb], with the Daleckii-Krein
+    derivative Dp: divided differences of p between clusters and
+    -f_c / (lam_i lam_j) within one, written without cancellation.
+    """
+    root, jb, lam, vectors, fc, pv, bounds = data
+    hm = hamiltonian @ jb
+    same = fc[:, None] == fc[None, :]
+    diff = np.where(same, 1., lam[:, None] - lam[None, :])
+    dd = np.where(same, -fc[:, None] / (lam[:, None] * lam[None, :]), (pv[:, None] - pv[None, :]) / diff)
+    dpb = vectors @ (dd * (vectors.conj().T @ (jb.conj().T @ hm) @ vectors)) @ vectors.conj().T
+    phi = (cho_solve(metric_factor, hm @ ((vectors * pv) @ vectors.conj().T)) + jb @ dpb) / root
+    return [phi[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]
+
+
+def _hamc_occupied_solver(energies, occupations, dt):
+    """Inverse of the occupied-span Jacobian of the hamc midpoint residual.
+
+    For C = C0 (I + Delta) with C0 an S-orthonormal frame, the start Fock
+    frozen and E = C0^H F C0, the occupied coordinates of the residual are
+    Q = -Delta - i dt dT R^-1, linearized at Gb = diag(f). dT collects the
+    first-order terms in E and Delta, Dp at diag(f) and the second
+    Daleckii-Krein derivative of p, whose divided differences on the 2/1
+    clusters are 1/4 for three indices in f = 2, 1 for none or one and -1/2
+    for two. Delta -> Q is real linear; it is inverted by a dense real LU
+    over 2 N^2 unknowns.
+    """
+    f = np.asarray(occupations, float)
+    count = len(f)
+    root = np.sqrt(f)
+    same = f[:, None] == f[None, :]
+    p1 = np.where(same, -1. / f[:, None], 0.)
+    twos = (f == 2.).astype(int)
+    multiplicity = twos[:, None, None] + twos[None, :, None] + twos[None, None, :]
+    p2 = np.choose(multiplicity, [1., 1., -.5, .25])
+    b0 = root[:, None] * energies * root[None, :]
+    d0 = p1 * b0
+
+    def apply(delta):
+        dg = root[:, None] * (delta + delta.conj().T) * root[None, :] / 2
+        db = root[:, None] * (delta.conj().T @ energies + energies @ delta) * root[None, :] / 2
+        d2 = np.einsum('ikj,ik,kj->ij', p2, dg, b0) + np.einsum('ikj,ik,kj->ij', p2, b0, dg)
+        dtrans = (energies @ (delta / 2) * root[None, :] + (energies * root[None, :]) @ (p1 * dg)
+                  + (delta / 2) * root[None, :] @ d0 + root[:, None] * (p1 * db + d2))
+        return -delta - 1j * dt * dtrans / root[None, :]
+
+    size = count * count
+    matrix = np.zeros((2 * size, 2 * size))
+    for k in range(2 * size):
+        delta = np.zeros(size, complex)
+        if k < size:
+            delta[k] = 1.
+        else:
+            delta[k - size] = 1j
+        image = apply(delta.reshape(count, count)).ravel()
+        matrix[:size, k], matrix[size:, k] = image.real, image.imag
+    factor = lu_factor(matrix)
+
+    def solve(coordinates):
+        x = lu_solve(factor, np.concatenate([coordinates.real.ravel(), coordinates.imag.ravel()]))
+        return (x[:size] + 1j * x[size:]).reshape(count, count)
+    return solve
+
+
+def _hamc_group_preconditioner(overlap, hamiltonian, initials, natives, dt, occupations):
+    """hamc preconditioner of one 2/1 spin with the exact occupied-span block.
+
+    As _midpoint_group_preconditioner, but the occupied coordinates are mapped
+    by the inverse of _hamc_occupied_solver, which keeps the inter-group
+    blocks of E that the closed-form pairs neglect.
+    """
+    joint = np.concatenate(initials, axis=1)
+    bounds = np.cumsum([0] + [c.shape[1] for c in initials])
+    blocks = list(zip(bounds[:-1], bounds[1:]))
+    f = np.concatenate([np.full(c.shape[1], o) for c, o in zip(initials, occupations)])
+    if not set(np.unique(f)) <= {1., 2.}:
+        raise ValueError("The hamc occupied-span preconditioner is derived for 2/1 groups only")
+    energies = joint.conj().T @ hamiltonian @ joint
+    solve = _hamc_occupied_solver(.5 * (energies + energies.conj().T), f, dt)
+
+    def precondition(residuals):
+        residual = np.concatenate(residuals, axis=1)
+        coordinates = joint.conj().T @ overlap @ residual
+        step = -solve(coordinates)
+        tangent = residual - joint @ coordinates
+        tangent = np.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
+        tangent -= joint @ (joint.conj().T @ overlap @ tangent)
+        total = joint @ step + tangent
+        return [total[:, lo:hi] for lo, hi in blocks]
+    return precondition
+
+
 def _parallel_transport(state, overlap, evaluate, time, dt, options):
     """Joint real-block Anderson solve; evaluate supplies alpha-scaled Focks.
 
@@ -339,6 +480,25 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     diag(f_g) and only intra-group rotations are removed. Both forms give the
     same continuous density dynamics, but this grouped form keeps the
     occupation spectrum exact.
+
+    A restricted 2/1 spin uses instead the hamc field. The grouped field of
+    _midpoint_phi is then not a Hamiltonian field, and under F -> F + c S it
+    gains c M G^-1 G_inter, with G_inter the inter-group block of the midpoint
+    Gram, so the discrete 2/1 dynamics depends on the energy zero. The PT
+    dynamics itself is not a Hamiltonian system; An and Lin (above, Sec. 2.2)
+    modify the energy to make it one. With Cb = C diag(f)^(1/2) and
+    Gb = Cb^H S Cb, pt_im integrates the Hamiltonian system of
+    H(Cb) = E[Cb p(Gb) Cb^H], p = f_c / x on each occupation cluster of Gb
+    (_hamc_fock_orbitals, _hamc_phi). On Gb = diag(f) its field is the grouped
+    PT field. Its implicit midpoint rule is symplectic, keeps the Gram up to
+    the solver tolerance and does not depend on the energy zero. Closed-shell
+    and unrestricted spins keep the field of _midpoint_phi and their steps are
+    unchanged. A 2/1 step iterates on the grouped residual until it has
+    fallen by _HAMC_SWITCH, then on the hamc residual with a new Anderson
+    history and, near the Gram constraint, the exact occupied-span block of
+    _hamc_group_preconditioner (see _HAMC_EXACT_GRAM); only the hamc residual
+    decides convergence. The switching iteration builds the midpoint Fock
+    twice.
     """
     midpoint = options.variant == "pt_im"
     label = "PT-IM" if midpoint else "PT-CN"
@@ -346,6 +506,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     spins = [spin for spin, _ in groups]
     members = [[i for i, s in enumerate(spins) if s == spin]
                for spin in range(len(state.coefficients))]
+    hamc_spins = [spin for spin, group in enumerate(members) if midpoint and len(group) > 1]
     initial = [state.coefficients[spin][:, columns] for spin, columns in groups]
     blocks = [c.copy() for c in initial]
     sizes = np.cumsum([0] + [c.size for c in initial])
@@ -377,7 +538,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                     return q + p - frame @ (frame.conj().T @ overlap @ p)
                 return precondition
 
-            def midpoint_steps(parts, errors):
+            def midpoint_steps(parts, errors, hamc):
                 # The split follows the S-orthonormalized midpoint span of the
                 # current iterate, with the start Fock. A split fixed at C0
                 # misplaces the part of the midpoint span that has left the
@@ -385,11 +546,13 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 # midpoint Gram eigenvalue), and the tangent block scales that
                 # error by tau |e_core|: 40 at dt = 90 for Cl 1s in NaCl.
                 frames = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
-                for group in members:
+                gram_min = [0.] * len(members)
+                for spin, group in enumerate(members):
                     joint = np.concatenate([frames[i] for i in group], axis=1)
                     if not joint.shape[1]:
                         continue
                     values, vectors = eigh(joint.conj().T @ overlap @ joint)
+                    gram_min[spin] = values[0]
                     if values[0] <= 1e-8:
                         joint = np.concatenate([initial[i] for i in group], axis=1)
                     else:
@@ -402,8 +565,16 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 for spin, group in enumerate(members):
                     if len(group) > 1:
                         # Restricted 2/1: precondition the occupied span jointly.
-                        joint = _midpoint_group_preconditioner(overlap, start[spin], [frames[i] for i in group],
-                                                               [natives[i] for i in group], half_dt)
+                        frame = [frames[i] for i in group]
+                        if (hamc and gram_min[spin] >= _HAMC_EXACT_GRAM
+                                and sum(c.shape[1] for c in frame) <= _HAMC_EXACT_MAX_ORBITALS):
+                            joint = _hamc_group_preconditioner(overlap, start[spin], frame,
+                                                               [natives[i] for i in group], dt,
+                                                               [state.occupations[spin][groups[i][1]][0]
+                                                                for i in group])
+                        else:
+                            joint = _midpoint_group_preconditioner(overlap, start[spin], frame,
+                                                                   [natives[i] for i in group], half_dt)
                         for i, step in zip(group, joint([errors[i] for i in group])):
                             steps[i] = step
                     else:
@@ -411,13 +582,24 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                             steps[i] = split(natives[i], frames[i])(errors[i])
                 return steps
 
-            def errors_of(parts, iteration):
+            def errors_of(parts, iteration, hamc=False):
                 mids = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
-                middle = evaluate(assemble(mids), time + half_dt, iteration)
+                orbitals, data = list(mids), {}
+                if hamc:
+                    for spin in hamc_spins:
+                        group = members[spin]
+                        xs, data[spin] = _hamc_fock_orbitals(
+                            overlap, [mids[i] for i in group],
+                            [state.occupations[spin][groups[i][1]] for i in group])
+                        for i, x in zip(group, xs):
+                            orbitals[i] = x
+                middle = evaluate(assemble(orbitals), time + half_dt, iteration)
                 errors = [None] * len(parts)
                 for spin, group in enumerate(members):
                     if group:
-                        phis = _midpoint_phi(overlap, metric_factor, middle[spin], [mids[i] for i in group])
+                        phis = (_hamc_phi(overlap, metric_factor, middle[spin], data[spin]) if spin in data
+                                else _midpoint_phi(overlap, metric_factor, middle[spin],
+                                                   [mids[i] for i in group]))
                         for i, phi in zip(group, phis):
                             errors[i] = initial[i] - parts[i] - 1j * dt * phi
                 return errors
@@ -432,13 +614,22 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                         for r, c, s in zip(rhs, parts, spins)]
 
         accelerator = AndersonAcceleration(history_size=options.history, regularization=1e-12)
-        first, follow = None, False
+        first, follow, hamc = None, False, False
         for iteration in range(1, options.max_iterations + 1):
-            errors = errors_of(blocks, iteration)
+            errors = errors_of(blocks, iteration, hamc) if midpoint else errors_of(blocks, iteration)
             residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
             first = residual if first is None else first
             if not np.isfinite(residual):
                 raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
+            if hamc_spins and not hamc and residual <= max(_HAMC_SWITCH * first, options.tolerance):
+                # Only the hamc residual decides convergence; the grouped
+                # history describes the other equation and is dropped.
+                hamc = True
+                accelerator = AndersonAcceleration(history_size=options.history, regularization=1e-12)
+                errors = errors_of(blocks, iteration, hamc)
+                residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
+                if not np.isfinite(residual):
+                    raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
             if residual <= options.tolerance:
                 break
             current = np.concatenate([c.ravel() for c in blocks])
@@ -446,7 +637,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 # The preconditioner changes with the iterate; Anderson mixing
                 # tolerated this better than periodic rebuilds with a history reset.
                 follow = follow or residual <= _MIDPOINT_FRAME_SWITCH * first
-                steps = midpoint_steps(blocks if follow else initial, errors)
+                steps = midpoint_steps(blocks if follow else initial, errors, hamc)
             else:
                 steps = [precondition(r) for r, precondition in zip(errors, preconditioners)]
             candidate = np.concatenate([(c + step).ravel() for c, step in zip(blocks, steps)])
