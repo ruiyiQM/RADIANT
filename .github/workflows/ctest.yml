@@ -1,0 +1,22 @@
+name: CTest
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  ctest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: python -m pip install numpy scipy "pyscf>=2.12"
+      - name: Configure tests
+        run: cmake -S . -B build -DPython3_EXECUTABLE="$(command -v python)"
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure --no-tests=error
