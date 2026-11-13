@@ -514,6 +514,34 @@ class HamiltonianTwoOneTests(unittest.TestCase):
         step = np.concatenate(closed_form([residual[:, :2], residual[:, 2:]]), axis=1)
         self.assertGreater(np.abs(step + joint @ delta).max(), .1)
 
+    def test_assembled_occupied_block_inverts_its_linear_map(self):
+        # The solver assembles the real-linear map Delta -> Q term by term; here
+        # the map is applied directly, for larger blocks and shuffled occupations.
+        def occupied_map(energies, f, dt, delta):
+            root = np.sqrt(f)
+            p1 = np.where(f[:, None] == f[None, :], -1. / f[:, None], 0.)
+            twos = (f == 2.).astype(int)
+            p2 = np.choose(twos[:, None, None] + twos[None, :, None] + twos[None, None, :], [1., 1., -.5, .25])
+            b0 = root[:, None] * energies * root[None, :]
+            dg = root[:, None] * (delta + delta.conj().T) * root[None, :] / 2
+            db = root[:, None] * (delta.conj().T @ energies + energies @ delta) * root[None, :] / 2
+            d2 = np.einsum('ikj,ik,kj->ij', p2, dg, b0) + np.einsum('ikj,ik,kj->ij', p2, b0, dg)
+            dtrans = (energies @ delta * root[None, :] / 2 + (energies * root[None, :]) @ (p1 * dg)
+                      + delta * root[None, :] @ (p1 * b0) / 2 + root[:, None] * (p1 * db + d2))
+            return -delta - 1j * dt * dtrans / root[None, :]
+
+        rng = np.random.default_rng(5)
+        for occupations in ([2, 1, 2], [1, 2, 2, 1, 2], [2] * 6 + [1] * 3, [1, 1, 1, 1], [2] * 5):
+            f = np.asarray(occupations, float)
+            n = len(f)
+            a = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+            energies = .5 * (a + a.conj().T)
+            delta = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+            for dt in (.3, 10.):
+                with self.subTest(occupations=occupations, dt=dt):
+                    solve = propagation._hamc_occupied_solver(energies, f, dt)
+                    assert_allclose(solve(occupied_map(energies, f, dt, delta)), delta, atol=1e-12, rtol=0)
+
     def test_exact_block_only_near_the_gram_constraint_and_for_small_blocks(self):
         state, overlap, core = random_model()
         fock = mean_field_fock(overlap, core)

@@ -323,15 +323,14 @@ _HAMC_SWITCH = 1e-3
 # (_hamc_group_preconditioner) while the smallest eigenvalue of the midpoint
 # Gram is at least _HAMC_EXACT_GRAM. Molecular 2/1 steps up to dt = 20 had
 # g_min >= 0.98. There it took N2 at alpha dt = 10 from 24-46 iterations to
-# 12, and M1 steps (N = 9, cheap Fock) from 19-45 to 18-38 at 1.5-2.2 times
-# the solver CPU. Random 2/1 states at dt = 1.5-2 have g_min 0.35-0.41,
-# where it failed or needed up to 5 times the iterations of the closed-form
-# block; the threshold lies between the two.
+# 12, and M1 steps (N = 9) from 15-45 to 15-38 at 0.83-1.05 times the step
+# CPU. Random 2/1 states at dt = 1.5-2 have g_min 0.35-0.41, where it
+# failed or needed up to 5 times the iterations of the closed-form block;
+# the threshold lies between the two.
 _HAMC_EXACT_GRAM = .9
-# Largest occupied block for that preconditioner. Its dense real LU over
-# 2 N^2 unknowns is rebuilt every iteration and grows as N^6: 0.27 s at
-# N = 24 and 1 s at N = 32 on one thread. Larger blocks keep
-# _midpoint_group_preconditioner.
+# Largest occupied block for that preconditioner. It is rebuilt every
+# iteration; its dense real LU over 2 N^2 unknowns grows as N^6. Larger
+# blocks keep _midpoint_group_preconditioner.
 _HAMC_EXACT_MAX_ORBITALS = 24
 
 
@@ -386,6 +385,14 @@ def _hamc_occupied_solver(energies, occupations, dt):
     clusters are 1/4 for three indices in f = 2, 1 for none or one and -1/2
     for two. Delta -> Q is real linear; it is inverted by a dense real LU
     over 2 N^2 unknowns.
+
+    With R = diag(f)^(1/2), dg = R (Delta + Delta^H) R / 2 and
+    db = R (Delta^H E + E Delta) R / 2,
+    dT = E Delta R / 2 + E R (p1 o dg) + Delta R d0 / 2 + R (p1 o db + d2).
+    Its coefficients on Delta[a, b] and conj(Delta[a, b]) are assembled
+    term by term as
+    L[i, j, a, b] = A[i, j, a] delta_jb + B[i, j, b] delta_ia and
+    K[i, j, a, b] = C[i, j, b] delta_ja + D[i, j, a] delta_ib.
     """
     f = np.asarray(occupations, float)
     count = len(f)
@@ -398,25 +405,26 @@ def _hamc_occupied_solver(energies, occupations, dt):
     b0 = root[:, None] * energies * root[None, :]
     d0 = p1 * b0
 
-    def apply(delta):
-        dg = root[:, None] * (delta + delta.conj().T) * root[None, :] / 2
-        db = root[:, None] * (delta.conj().T @ energies + energies @ delta) * root[None, :] / 2
-        d2 = np.einsum('ikj,ik,kj->ij', p2, dg, b0) + np.einsum('ikj,ik,kj->ij', p2, b0, dg)
-        dtrans = (energies @ (delta / 2) * root[None, :] + (energies * root[None, :]) @ (p1 * dg)
-                  + (delta / 2) * root[None, :] @ d0 + root[:, None] * (p1 * db + d2))
-        return -delta - 1j * dt * dtrans / root[None, :]
-
+    eye = np.eye(count)
+    # E R (p1 o dg): energies[i, x] f[x] p1[x, j] r[j] / 2 on Delta[x, j] and conj(Delta[j, x]).
+    shared = (energies * f[None, :])[:, None, :] * p1.T[None, :, :] * root[None, :, None] / 2
+    # R (p1 o db): r[i]^2 r[j] p1[i, j] / 2 times E[i, a] on Delta[a, j] and E[a, j] on conj(Delta[a, i]).
+    weight = f[:, None] * root[None, :] * p1 / 2
+    # R d2: p2 terms from dg[i, k] (first) and dg[k, j] (second).
+    first = np.einsum('i,b,ibj,bj->ijb', f, root, p2, b0) / 2
+    second = np.einsum('i,a,j,iaj,ia->ija', root, root, root, p2, b0) / 2
+    a = energies[:, None, :] * root[None, :, None] / 2 + shared + weight[:, :, None] * energies[:, None, :] + second
+    b = (root[:, None] * d0).T[None] / 2 + first
+    c = shared + second
+    d = weight[:, :, None] * energies.T[None, :, :] + first
+    linear = np.einsum('ija,jb->ijab', a, eye) + np.einsum('ijb,ia->ijab', b, eye)
+    conjugate = np.einsum('ijb,ja->ijab', c, eye) + np.einsum('ija,ib->ijab', d, eye)
+    scale = (-1j * dt / root)[None, :, None, None]
     size = count * count
-    matrix = np.zeros((2 * size, 2 * size))
-    for k in range(2 * size):
-        delta = np.zeros(size, complex)
-        if k < size:
-            delta[k] = 1.
-        else:
-            delta[k - size] = 1j
-        image = apply(delta.reshape(count, count)).ravel()
-        matrix[:size, k], matrix[size:, k] = image.real, image.imag
-    factor = lu_factor(matrix)
+    linear = (scale * linear - np.einsum('ia,jb->ijab', eye, eye)).reshape(size, size)
+    conjugate = (scale * conjugate).reshape(size, size)
+    plus, minus = linear + conjugate, linear - conjugate
+    factor = lu_factor(np.block([[plus.real, -minus.imag], [plus.imag, minus.real]]))
 
     def solve(coordinates):
         x = lu_solve(factor, np.concatenate([coordinates.real.ravel(), coordinates.imag.ravel()]))
