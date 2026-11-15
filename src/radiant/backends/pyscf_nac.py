@@ -40,6 +40,14 @@ real and imaginary parts need one Z-vector each, for all 3N coordinates at once.
 Requires an energy that depends on Re P only (pure functionals, or density_convention
 'paper_real'); this includes complex fractional-occupation-like ground minima. The ground is
 treated as stationary: for propagated states the error is first order in their orbital gradient.
+
+An unrestricted pair is two single determinants, each a stationary point of the same energy, so
+both are relaxed and there is no DTO rotation:
+  d = (<0|d1> - conj<1|d0>)/2,  <Y|dX> = sum_s [Tr(<mu|d nu> t^s_YX) + sum_pi U^s_pi W^s_pi],
+with u_oo = -S1_oo/2 and the virtual rows from the per-spin CPKS of state X. Each state needs two
+Z-vectors (real and imaginary part); MINRES is used because an excited state's Hessian is
+indefinite. For a non-orthogonal pair the Loewdin-consistent coupling has the same direction and a
+norm larger by 1/sqrt(1 - |<0|1>|^2).
 """
 
 from copy import deepcopy
@@ -47,6 +55,7 @@ from copy import deepcopy
 import numpy as np
 from pyscf import dft
 from scipy.linalg import null_space
+from scipy.sparse.linalg import LinearOperator, minres
 
 from ..core.coupling import NACResult, ZeroNACError
 from ..core.overlap import _determinants
@@ -60,15 +69,35 @@ def _adjugate(m):
     return np.linalg.det(u) * np.linalg.det(vh) * (vh.conj().T * cofactors) @ u.conj().T
 
 
-def _transition_density(left, right, overlap):
-    """AO matrix t with <left| sum_i o(i) |right> = Tr(O t), spin summed."""
-    t = 0
+def _spin_transition_densities(left, right, overlap):
+    """AO matrices (t_alpha, t_beta) with <left| sum_i o_s(i) |right> = Tr(O t_s)."""
+    ta = tb = 0
     for al, bl, wl in _determinants(left):
         for ar, br, wr in _determinants(right):
             ma, mb = al.conj().T @ overlap @ ar, bl.conj().T @ overlap @ br
-            t = t + wl * wr * (np.linalg.det(mb) * ar @ _adjugate(ma) @ al.conj().T
-                               + np.linalg.det(ma) * br @ _adjugate(mb) @ bl.conj().T)
-    return t
+            ta = ta + wl * wr * np.linalg.det(mb) * ar @ _adjugate(ma) @ al.conj().T
+            tb = tb + wl * wr * np.linalg.det(ma) * br @ _adjugate(mb) @ bl.conj().T
+    return ta, tb
+
+
+def _transition_density(left, right, overlap):
+    """AO matrix t with <left| sum_i o(i) |right> = Tr(O t), spin summed."""
+    return sum(_spin_transition_densities(left, right, overlap))
+
+
+def _canonical(occupied, overlap, fock):
+    """[occupied | complement] diagonalising fock in each block; the occupied rotation has
+    determinant 1, so the determinant and its phase are unchanged."""
+    inverse_half, half = lowdin(overlap)
+    x = half @ occupied
+    c = inverse_half @ np.column_stack([x, null_space(x.conj().T)])
+    nocc = occupied.shape[1]
+    e = np.zeros(c.shape[1])
+    for block in (slice(0, nocc), slice(nocc, None)):
+        e[block], v = np.linalg.eigh(c[:, block].conj().T @ fock @ c[:, block])
+        v[:, 0] *= np.conj(np.linalg.det(v))
+        c[:, block] = c[:, block] @ v
+    return c, e
 
 
 def _derivative_integrals(mol):
@@ -106,26 +135,20 @@ class ZVectorNAC:
 
     def compute(self, execution):
         provider = execution.providers[0]
-        if len(execution.states) != 2 or getattr(provider, "unrestricted", True):
-            raise ValueError("Z-vector NAC needs a restricted PySCF two-state execution")
+        if len(execution.states) != 2 or not hasattr(provider, "unrestricted"):
+            raise ValueError("Z-vector NAC needs a PySCF two-state execution")
         if not _uses_real_density(provider):
             raise ValueError("Z-vector NAC needs an energy of Re P only: a pure functional or paper_real")
+        if provider.unrestricted:
+            return self._result(self._unrestricted(execution))
         ground, gauge_excited = execution.states[0], execution.gauge[1]
         mol, overlap = provider.mf.mol, provider.overlap
         nocc = ground.coefficients[0].shape[1]
         density = ground.density().real
         inverse_half, half = lowdin(overlap)
 
-        # canonical [occupied | complement]; the occupied rotation has determinant 1, so the
-        # ground determinant and its phase (the execution gauge) are unchanged
-        x = half @ ground.coefficients[0]
-        c = inverse_half @ np.column_stack([x, null_space(x.conj().T)])
-        fock = provider.fock(density)
-        e = np.zeros(c.shape[1])
-        for block in (slice(0, nocc), slice(nocc, None)):
-            e[block], v = np.linalg.eigh(c[:, block].conj().T @ fock @ c[:, block])
-            v[:, 0] *= np.conj(np.linalg.det(v))
-            c[:, block] = c[:, block] @ v
+        # the ground determinant and its phase (the execution gauge) are unchanged
+        c, e = _canonical(ground.coefficients[0], overlap, provider.fock(density))
         co, cv = c[:, :nocc], c[:, nocc:]
         delta = e[nocc:, None] - e[None, :nocc]
 
@@ -184,11 +207,100 @@ class ZVectorNAC:
         u_tv = u_t[..., nocc:, :]
         relaxed -= np.einsum("bxai,ai->bx", u_tv, alpha) + np.einsum("bxai,ai->bx", u_tv.conj(), beta)
         relaxed -= .5 * np.conj(np.einsum("axij,ij->ax", u_occ - u_t[..., :nocc, :], w[:nocc]))
-        raw = .5 * (a_t - np.conj(b_t)) + relaxed
+        return self._result(.5 * (a_t - np.conj(b_t)) + relaxed)
+
+    @staticmethod
+    def _result(raw):
         norm = float(np.linalg.norm(raw.real))
         if not np.isfinite(norm) or norm <= 64 * np.finfo(float).eps:
             raise ZeroNACError("The Z-vector NAC has no real part; its direction is undefined")
         return NACResult(raw, raw.real / norm, norm)
+
+    def _unrestricted(self, execution):
+        occupied = [tuple(c[:, f == 1] for c, f in zip(s.coefficients, s.occupations)) for s in execution.gauge]
+        g10 = self._relaxed_coupling(execution.providers[0], occupied[0], occupied[1])   # <1|d0>
+        g01 = self._relaxed_coupling(execution.providers[1], occupied[1], occupied[0])   # <0|d1>
+        return .5 * (g01 - np.conj(g10))
+
+    def _relaxed_coupling(self, provider, right, left):
+        """<left| d right>, natm x 3, with the right determinant relaxed by per-spin CPKS."""
+        mol, overlap = provider.mf.mol, provider.overlap
+        density = np.array([c @ c.conj().T for c in right])
+        fock = provider.fock(density)
+        nocc = [c.shape[1] for c in right]
+        cs, es = zip(*(_canonical(right[s], overlap, fock[s]) for s in range(2)))
+        co = [c[:, :n] for c, n in zip(cs, nocc)]
+        cv = [c[:, n:] for c, n in zip(cs, nocc)]
+        t = _spin_transition_densities(OrbitalState(left, tuple(np.ones(c.shape[1]) for c in left)),
+                                       OrbitalState(co, tuple(np.ones(n) for n in nocc)), overlap)
+        basis, ds = _derivative_integrals(mol)
+        w = [(co[s].conj().T @ overlap @ t[s] @ overlap @ cs[s]).T for s in range(2)]   # (nmo, nocc)
+
+        # response at Re P^s, through its natural orbitals scaled by sqrt(n) with occupation 1
+        inverse_half, half = lowdin(overlap)
+        mo, occ = [], []
+        for s in range(2):
+            n, vectors = np.linalg.eigh(half @ density[s].real @ half)
+            keep = n > 1e-10
+            mo.append((inverse_half @ vectors[:, keep]) * np.sqrt(n[keep]))
+            occ.append(np.ones(int(keep.sum())))
+        mf = deepcopy(provider.mf)
+        mf.mo_coeff, mf.mo_occ = mo, occ
+        response = mf.gen_response(mo, occ, hermi=1)
+        h1 = mf.Hessian().make_h1(mo, occ)
+        delta = [es[s][nocc[s]:, None] - es[s][None, :nocc[s]] for s in range(2)]
+        s1 = [cs[s].conj().T @ ds @ co[s] for s in range(2)]
+
+        def kernel(rotations, rows):
+            dms = []
+            for s in range(2):
+                d = rows[s] @ rotations[s] @ co[s].conj().T
+                dms.append((d + d.conj().swapaxes(-1, -2)).real.reshape(-1, *overlap.shape))
+            v = np.asarray(response(np.array(dms)))
+            return [(cv[s].conj().T @ v[s] @ co[s]).reshape(*rotations[s].shape[:-2], *delta[s].shape)
+                    for s in range(2)]
+
+        u_occ = [-.5 * s1[s][..., :nocc[s], :] for s in range(2)]
+        k_occ = kernel(u_occ, co)
+        rhs = [-(cv[s].conj().T @ np.asarray(h1[s]) @ co[s] - s1[s][..., nocc[s]:, :] * es[s][:nocc[s]]) - k_occ[s]
+               for s in range(2)]
+        coupling = sum(np.einsum("axij,ji->ax", basis, t[s]) + np.einsum("axij,ij->ax", u_occ[s], w[s][:nocc[s]])
+                       for s in range(2))
+
+        # the relaxation sum_x U_x W is real-linear in U: one Z-vector each for its real and imaginary part
+        sizes = [d.size for d in delta]
+
+        def pack(parts):
+            z = np.concatenate([p.ravel() for p in parts])
+            return np.concatenate([z.real, z.imag])
+
+        def unpack(x):
+            z = x[:sum(sizes)] + 1j * x[sum(sizes):]
+            return [z[:sizes[0]].reshape(delta[0].shape), z[sizes[0]:].reshape(delta[1].shape)]
+
+        def hessian(x):
+            u = unpack(x)
+            k = kernel(u, cv)
+            return pack([delta[s] * u[s] + k[s] for s in range(2)])
+
+        n = 2 * sum(sizes)
+        # complex FON-like minima have a degenerate occupied/virtual pair (delta = 0), so the
+        # diagonal preconditioner is floored as in the restricted solver
+        floor = 1 / np.maximum(np.abs(pack(delta)[:n // 2]), .05)
+        preconditioner = LinearOperator((n, n), matvec=lambda x: np.concatenate([floor, floor]) * x, dtype=float)
+        operator = LinearOperator((n, n), matvec=hessian, dtype=float)
+        for part, target in ((1, [w[s][nocc[s]:].conj() for s in range(2)]),
+                             (1j, [1j * w[s][nocc[s]:].conj() for s in range(2)])):
+            b = pack(target)
+            if not np.any(b):
+                continue
+            # MINRES measures the residual in the preconditioner norm, i.e. roughly the error of z
+            z, status = minres(operator, b, M=preconditioner, rtol=self.tolerance, maxiter=self.max_iterations)
+            if status != 0:
+                raise RuntimeError("Z-vector MINRES did not converge")
+            z = unpack(z)
+            coupling = coupling + part * sum(np.real(np.einsum("ai,bxai->bx", z[s].conj(), rhs[s])) for s in range(2))
+        return coupling
 
     def _solve(self, hessian, preconditioner, target):
         """Diagonally preconditioned CG for the real-linear symmetric orbital hessian."""

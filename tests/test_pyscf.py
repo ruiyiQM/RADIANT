@@ -227,5 +227,41 @@ class UnrestrictedPairTests(unittest.TestCase):
         for pair in ((ground, fewer), (restricted, excited)):
             with self.assertRaises(ValueError):
                 dto_pair(pair, overlap)
-        with self.assertRaises(ValueError):
-            ZVectorNAC().compute(run)
+
+    def test_zvector_nac_matches_static_fd_for_a_non_orthogonal_pair(self):
+        from radiant.core.overlap import pair_overlap
+        half = np.radians(55)
+        mol = gto.M(atom=f"N 0 0 0; O {1.18*np.sin(half)} {1.18*np.cos(half)} 0; O {-1.24*np.sin(half)} {1.24*np.cos(half)} 0",
+                    basis="sto-3g", spin=1, verbose=0)
+
+        def mom(m, coeff, occ):
+            mf = dft.UKS(m); mf.xc = "pbe"; mf.chkfile = None; mf.conv_tol = 1e-13
+            if coeff is None:
+                mf.kernel()
+                return mf
+            mf = scf.addons.mom_occ(mf, coeff, occ)
+            mf.kernel(dm0=mf.make_rdm1(coeff, occ))
+            assert mf.converged
+            return mf
+        ground = mom(mol, None, None)
+        occ = np.array(ground.mo_occ, dtype=float)
+        nb = int(occ[1].sum())
+        occ[1, nb-1], occ[1, nb] = 0, 1
+        pair = (ground, mom(mol, ground.mo_coeff, occ))
+        run = LocalExecution([PySCFProvider(mf) for mf in pair])
+        self.assertGreater(abs(run.overlap(run.snapshot(), run.snapshot())[0, 1]), 1e-2)
+        d = ZVectorNAC().compute(run).raw
+        assert_allclose(d.imag, 0, atol=1e-10, rtol=0)
+        rng = np.random.default_rng(3)
+        h = 1e-3
+        for v in [d.real] + list(rng.normal(size=(2, 3, 3))):
+            v = v/np.linalg.norm(v)
+            ends = []
+            for sign in (1, -1):
+                m = mol.set_geom_(mol.atom_coords() + sign*h*v, unit="Bohr", inplace=False)
+                moved = LocalExecution([PySCFProvider(mom(m, mf.mo_coeff, mf.mo_occ)) for mf in pair]).gauge
+                o = pair_overlap(run.gauge, moved, gto.intor_cross("int1e_ovlp", mol, m))
+                ends.append(o*np.sign(np.diag(o).real))
+            fd = (ends[0] - ends[1])/(2*h)
+            # FD truncation (h**2) limits the agreement to ~1e-4 |d|
+            self.assertLess(abs(np.sum(d.real*v) - .5*(fd[0, 1] - fd[1, 0]).real), 5e-4*np.linalg.norm(d))
