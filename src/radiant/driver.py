@@ -33,7 +33,7 @@ import tempfile
 
 import numpy as np
 
-from .core.coupling import PaperFD, ZeroNACError
+from .core.coupling import ZeroNACError
 
 
 HOP_EVENT_DTYPE = np.dtype([
@@ -44,6 +44,8 @@ HOP_EVENT_DTYPE = np.dtype([
 class Trajectory:
     """Single-RT-state Ehrenfest or paper two-state CN+MASH.
 
+    MASH hops rescale along the static Z-vector NAC unless nac is given.
+
     The single-state route also covers large-alpha following of an explicitly
     prepared branch; its force and clock remain physical and unscaled.
     """
@@ -51,7 +53,10 @@ class Trajectory:
     def __init__(self, execution, nuclei, *, method=None, nac=None):
         self.execution, self.nuclei = execution, deepcopy(nuclei)
         self.method = method
-        self.nac = PaperFD() if nac is None and method is not None else nac
+        if nac is None and method is not None:
+            from .backends.pyscf_nac import ZVectorNAC
+            nac = ZVectorNAC()
+        self.nac = nac
         if not np.allclose(execution.positions, nuclei.positions, atol=1e-12, rtol=0):
             raise ValueError("Electronic and nuclear geometries differ")
         self.observation = execution.observe(forces=True)
@@ -100,7 +105,7 @@ class Trajectory:
                     event = [number, target_time, active, candidate, "failed", np.nan,
                              observation.energies[candidate] - observation.energies[active]]
                     try:
-                        direction = self.nac.compute(self.execution).real_direction
+                        direction = self.nac.compute(self.execution).raw
                     except ZeroNACError:
                         event[4] = "zero_nac"
                         raise

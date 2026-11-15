@@ -113,7 +113,8 @@ class FDTests(unittest.TestCase):
                          for name in ("ground","excited"))
             execution=LocalExecution([PySCFProvider(mf,density_convention="paper_real") for _ in states],states)
             for dt,expected in zip(fixture["dt_au"],fixture["absolute_dot"]):
-                result=PaperFD(dt=float(dt),options=CNOptions(tolerance=1e-6,max_iterations=40)).compute(execution)
+                result=PaperFD(dt=float(dt),options=CNOptions(tolerance=1e-6,max_iterations=40),
+                               subtract_drift=False).compute(execution)
                 dot=np.sum(result.real_direction*fixture["static_direction"])
                 self.assertGreater(dot,0.)
                 assert_allclose(dot,expected,atol=1e-12,rtol=0)
@@ -131,7 +132,7 @@ class FDTests(unittest.TestCase):
                      zip(fixture["coefficients_real"],fixture["occupations"]))
         execution=LocalExecution([PySCFProvider(mf,density_convention="paper_real"),
                                   PySCFProvider(mf,density_convention="paper_real")],states)
-        probe=PaperFD(displacement=fixture["displacement"],dt=fixture["dt"],alpha=fixture["alpha"],
+        probe=PaperFD(displacement=fixture["displacement"],dt=fixture["dt"],alpha=fixture["alpha"],subtract_drift=False,
                       options=CNOptions(tolerance=fixture["tolerance"],max_iterations=fixture["max_iterations"]))
         result=probe.compute(execution)
         assert_allclose(result.real_direction,fixture["expected_direction"],atol=1e-12,rtol=0)
@@ -146,7 +147,9 @@ class FDTests(unittest.TestCase):
         ToyProvider.trace=[]
         run=LocalExecution([ToyProvider(0),ToyProvider(1)],alphas=[80.,40.],time=2.)
         before=run.snapshot()
-        result=PaperFD().compute(run)
+        with self.assertRaises(ZeroNACError):  # the toy coupling is pure time evolution: all drift
+            PaperFD().compute(run)
+        result=PaperFD(subtract_drift=False).compute(run)
         assert_allclose(np.linalg.norm(result.real_direction),1.,atol=1e-12)
         self.assertTrue(np.iscomplexobj(result.raw))
         self.assertEqual(run.time,2.)
@@ -156,7 +159,7 @@ class FDTests(unittest.TestCase):
         for a,b in zip(run.states,before.states):
             assert_allclose(a.density(),b.density(),atol=0)
         baseline=LocalExecution([ToyProvider(0),ToyProvider(1)],alphas=[1.,1.],time=2.)
-        assert_allclose(PaperFD().compute(baseline).raw,result.raw,atol=1e-12,rtol=0)
+        assert_allclose(PaperFD(subtract_drift=False).compute(baseline).raw,result.raw,atol=1e-12,rtol=0)
         with self.assertRaises(ValueError):
             PaperFD(steps=2)
 
@@ -235,6 +238,17 @@ class SpinTests(unittest.TestCase):
                 results.append(momentum)
             assert_allclose(*results,atol=2e-15,rtol=0)
 
+    def test_complex_nac_uses_the_phase_independent_mass_weighted_axis(self):
+        masses=np.array([2.,5.]);p=np.array([[2.,1,0],[0,1,3]])
+        nac=np.array([[1.,.2,0],[0,.5,-.3]])+1j*np.array([[.3,-.4,.1],[.6,0,.2]])
+        a,b=(part/np.sqrt(masses[:,None]) for part in (nac.real,nac.imag))
+        phase=.5*np.arctan2(-2*np.sum(a*b),np.sum(a*a)-np.sum(b*b))  # maximises |Re(exp(i phase) nac)|
+        expected=MASH([.6,0.,.8]).resolve_hop(p,(np.exp(1j*phase)*nac).real,[0.,.3],masses,initial_state=0)[0]
+        for theta in (0.,1.,2.5,-2.):
+            momentum,outcome,_=MASH([.6,0.,.8]).resolve_hop(p,np.exp(1j*theta)*nac,[0.,.3],masses,initial_state=0)
+            self.assertEqual(outcome,"accepted")
+            assert_allclose(momentum,expected,atol=1e-12,rtol=0)
+
 
 class DriverTests(unittest.TestCase):
     def hopping_run(self, initial=1, momentum=0.):
@@ -242,7 +256,7 @@ class DriverTests(unittest.TestCase):
         def propagate(*args):
             method.coefficients=spin_to_coefficients([.6,0.,-.8 if initial else .8])
         method.propagate=propagate
-        nac=type("Axis",(),{"compute":lambda self,run:NACResult(np.ones((1,3),complex),np.array([[1.,0,0]]),1.)})()
+        nac=type("Axis",(),{"compute":lambda self,run:NACResult(np.array([[1.,0,0]],complex),np.array([[1.,0,0]]),1.)})()
         run=Trajectory(LocalExecution([ToyProvider(0,force=.1),ToyProvider(1,force=.2)]),
                        NuclearState([[0,0,0]],[[momentum,0,0]],[2.]),method=method,nac=nac)
         return run

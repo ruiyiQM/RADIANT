@@ -46,36 +46,47 @@ class PaperFD:
 
     The normalized real axis reproduces the paper approximation, not a
     calibrated general complex NAC magnitude. The full complex probe is kept.
+    The signed branches (-dt at -displacement, +dt at +displacement) also pick
+    up the intrinsic evolution of a non-stationary state pair, a term
+    (dt/displacement) <0|d_t 1> that is the same for every coordinate.
+    subtract_drift removes it with one undisplaced branch pair (zero for
+    stationary states); subtract_drift=False reproduces the paper probe.
     """
 
     def __init__(self, *, displacement=.01, dt=4., alpha=1., steps=1,
-                 options=CNOptions("cn_accelerated", 1e-6, 80)):
+                 options=CNOptions("cn_accelerated", 1e-6, 80), subtract_drift=True):
         if (not np.isfinite([displacement, dt, alpha]).all()
                 or min(displacement, dt, alpha) <= 0 or steps != 1):
             raise ValueError("Paper FD requires positive parameters and steps=1")
         if options.variant in ("pt_cn", "pt_im"):
             raise ValueError("Paper FD does not support PT branches")
         self.displacement, self.dt, self.alpha = displacement, dt, alpha
-        self.options = options
+        self.options, self.subtract_drift = options, subtract_drift
 
     def compute(self, execution):
         central = execution.snapshot()
         positions = execution.positions
+
+        def branch_coupling(offset):
+            endpoints = []
+            for sign in (-1, 1):
+                execution.restore(central)
+                execution.advance(positions + sign * offset, sign * self.dt,
+                    alphas=(self.alpha, self.alpha), options=self.options,
+                    gauge_reference=central, forces=False)
+                endpoints.append(execution.snapshot())
+            _, _, coupling = overlap_coupling(execution.overlap(*endpoints), 2*self.displacement)
+            return coupling[0, 1]
+
         raw = np.zeros_like(positions, dtype=complex)
         try:
             for atom in range(len(positions)):
                 for axis in range(3):
-                    endpoints = []
-                    for sign in (-1, 1):
-                        execution.restore(central)
-                        end = positions.copy()
-                        end[atom, axis] += sign * self.displacement
-                        execution.advance(end, sign * self.dt,
-                            alphas=(self.alpha, self.alpha), options=self.options,
-                            gauge_reference=central, forces=False)
-                        endpoints.append(execution.snapshot())
-                    _, _, coupling = overlap_coupling(execution.overlap(*endpoints), 2*self.displacement)
-                    raw[atom, axis] = coupling[0, 1]
+                    offset = np.zeros_like(positions)
+                    offset[atom, axis] = self.displacement
+                    raw[atom, axis] = branch_coupling(offset)
+            if self.subtract_drift:
+                raw -= branch_coupling(np.zeros_like(positions))
         finally:
             execution.restore(central)
         norm = float(np.linalg.norm(raw.real))

@@ -90,10 +90,12 @@ class MASH:
         self.coefficients = candidate
 
     def resolve_hop(self, momentum, direction, energies, masses, *, initial_state):
-        """Paper real-axis rescaling; returns momentum, outcome and parallel KE.
+        """Rescale along the phase-independent real axis of the (complex) NAC.
 
-        shortcut: only the paper real-axis direction is established, derive and
-        review the general complex momentum direction before extending it.
+        In mass-weighted coordinates the axis maximises |Re(exp(i phi) d)| over
+        the arbitrary relative state phase phi: the first right singular vector
+        of [Re d; Im d]. A real d gives the paper real axis; the sign of the
+        axis does not change the result. Returns momentum, outcome and parallel KE.
         """
         from radiant.core.coupling import ZeroNACError
         momentum, direction = np.asarray(momentum), np.asarray(direction)
@@ -104,11 +106,12 @@ class MASH:
                 or initial_state not in (0, 1) or self.active_state == initial_state):
             raise ValueError("Invalid MASH hop proposal")
         weighted = momentum / np.sqrt(masses[:, None])
-        axis = direction.real / np.sqrt(masses[:, None])
-        norm = np.linalg.norm(axis)
-        if norm <= 64 * np.finfo(float).eps:
-            raise ZeroNACError("The paper real NAC axis is undefined")
-        axis /= norm
+        coupling = direction / np.sqrt(masses[:, None])
+        _, singular, vh = np.linalg.svd(np.array([coupling.real.ravel(), coupling.imag.ravel()]),
+                                        full_matrices=False)
+        if singular[0] <= 64 * np.finfo(float).eps:
+            raise ZeroNACError("The NAC real axis is undefined")
+        axis = vh[0].reshape(momentum.shape)
         parallel = np.sum(weighted * axis)
         kinetic = .5 * parallel**2
         gap = energies[1 - initial_state] - energies[initial_state]

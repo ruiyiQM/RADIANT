@@ -97,7 +97,7 @@ def _uses_real_density(provider):
 
 
 class ZVectorNAC:
-    """Drop-in for PaperFD: compute(execution) -> NACResult, direction Re(raw)/|Re raw|."""
+    """Drop-in for PaperFD: compute(execution) -> NACResult; MASH uses the complex raw."""
 
     def __init__(self, *, tolerance=1e-8, max_iterations=200):
         if not np.isfinite(tolerance) or tolerance <= 0 or int(max_iterations) != max_iterations or max_iterations < 1:
