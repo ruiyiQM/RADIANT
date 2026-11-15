@@ -48,11 +48,23 @@ class Trajectory:
 
     The single-state route also covers large-alpha following of an explicitly
     prepared branch; its force and clock remain physical and unscaled.
+
+    hop_tolerance=None keeps the paper scheme: a hop is attempted at the end of
+    the step in which S_z changed sign. A positive xi selects the piecewise-
+    continuous time-reversible scheme (rev-pc; Geuther, Asnaashari and
+    Richardson, JCTC 21, 2179 (2025)): the hop time tau is located by
+    interpolating S_z until 0 < s S_z(tau) < xi on the new side s, the step is
+    split there, and the hop is applied at q(tau) before continuing on the
+    selected surface. At most one hop per step is assumed.
     """
 
-    def __init__(self, execution, nuclei, *, method=None, nac=None):
+    def __init__(self, execution, nuclei, *, method=None, nac=None, hop_tolerance=None):
+        if hop_tolerance is not None and (method is None or not np.isfinite(hop_tolerance)
+                                          or not 0 < hop_tolerance < 1):
+            raise ValueError("hop_tolerance needs MASH and must lie in (0, 1)")
         self.execution, self.nuclei = execution, deepcopy(nuclei)
         self.method = method
+        self.hop_tolerance = hop_tolerance
         if nac is None and method is not None:
             from .backends.pyscf_nac import ZVectorNAC
             nac = ZVectorNAC()
@@ -89,20 +101,19 @@ class Trajectory:
         target_time = self.initial_time + number * dt
         event = None
         try:
-            half_momentum = self.nuclei.momenta + .5 * dt * self.observation.forces[active]
-            velocity = half_momentum / self.nuclei.masses[:, None]
-            midpoint = self.nuclei.positions + .5 * dt * velocity
-            end = self.nuclei.positions + dt * velocity
-            result = self.execution.advance(end, target_time - self.time, midpoint=midpoint,
-                                            n_substeps=n_substeps, forces=True)
+            end, momentum, result = self._segment(self.nuclei.positions, self.nuclei.momenta,
+                                                  self.observation, active, dt, target_time, n_substeps)
             observation = result.observation
-            momentum = half_momentum + .5 * dt * observation.forces[active]
             if self.method is not None:
-                self.method.propagate(self.observation.energies, observation.energies,
-                                      result.overlap_raw, dt)
                 candidate = self.method.active_state
                 if candidate != active:
-                    event = [number, target_time, active, candidate, "failed", np.nan,
+                    hop_time, fraction = target_time, 1.
+                    if self.hop_tolerance is not None and abs(self.method.spin[2]) >= self.hop_tolerance:
+                        fraction, end, momentum, result = self._locate_hop(
+                            before, method_before, active, dt, target_time, n_substeps)
+                        observation = result.observation
+                        hop_time = self.execution.time
+                    event = [number, hop_time, active, candidate, "failed", np.nan,
                              observation.energies[candidate] - observation.energies[active]]
                     try:
                         direction = self.nac.compute(self.execution).raw
@@ -112,6 +123,13 @@ class Trajectory:
                     momentum, outcome, kinetic = self.method.resolve_hop(momentum, direction,
                         observation.energies, self.nuclei.masses, initial_state=active)
                     event[4:6] = [outcome, kinetic]
+                    if fraction < 1:   # rev-pc: finish the step on the selected surface
+                        selected = self.method.active_state
+                        end, momentum, result = self._segment(end, momentum, observation, selected,
+                                                              (1 - fraction) * dt, target_time, n_substeps)
+                        observation = result.observation
+                        if self.method.active_state != selected:
+                            raise RuntimeError("A second hop within one step; reduce dt")
             if not np.isfinite(momentum).all():
                 raise ValueError("Non-finite nuclear momentum")
             self.nuclei.positions, self.nuclei.momenta = end, momentum
@@ -147,6 +165,50 @@ class Trajectory:
                 self.hop_events.append(tuple(event))
             raise
         return frame
+
+    def _segment(self, start, momentum, observation, active, dt, end_time, n_substeps):
+        """Velocity Verlet on surface `active`, electrons to end_time, then the MASH spin."""
+        half_momentum = momentum + .5 * dt * observation.forces[active]
+        velocity = half_momentum / self.nuclei.masses[:, None]
+        end = start + dt * velocity
+        result = self.execution.advance(end, end_time - self.execution.time, midpoint=start + .5 * dt * velocity,
+                                        n_substeps=n_substeps, forces=True)
+        momentum = half_momentum + .5 * dt * result.observation.forces[active]
+        if self.method is not None:
+            self.method.propagate(observation.energies, result.observation.energies, result.overlap_raw, dt)
+        return end, momentum, result
+
+    def _locate_hop(self, before, method_before, active, dt, target_time, n_substeps, max_iterations=50):
+        """rev-pc root search: re-propagate [0, tau] until S_z(tau) lies within xi on the new side.
+
+        tau starts from linear interpolation of S_z(0) and S_z(1) and is then
+        refined by a spline through all S_z(tau) obtained, kept inside the sign
+        bracket (bisection if the spline root leaves it). Returns tau and the
+        segment ending there, with execution and spin at tau.
+        """
+        from scipy.interpolate import CubicSpline
+        side = np.sign(self.method.spin[2])
+        goal = .5 * side * self.hop_tolerance
+        samples = {0.: method_before.spin[2] - goal, 1.: self.method.spin[2] - goal}
+        start, start_time = self.nuclei.positions, self.observation.time
+        tau = samples[0.] / (samples[0.] - samples[1.])
+        for _ in range(max_iterations):
+            self.execution.restore(before)
+            self.method.__dict__.clear()
+            self.method.__dict__.update(deepcopy(method_before).__dict__)
+            segment = self._segment(start, self.nuclei.momenta, self.observation, active, tau * dt,
+                                    start_time + tau * (target_time - start_time), n_substeps)
+            spin_z = self.method.spin[2]
+            if 0 < side * spin_z < self.hop_tolerance:
+                return (tau, *segment)
+            samples[tau] = spin_z - goal
+            taus = np.array(sorted(samples))
+            values = np.array([samples[t] for t in taus])
+            k = int(np.flatnonzero(np.sign(values[:-1]) != np.sign(values[1:]))[0])
+            low, high = taus[k], taus[k + 1]
+            roots = [r for r in CubicSpline(taus, values).roots(extrapolate=False) if low < r < high]
+            tau = roots[0] if roots else .5 * (low + high)
+        raise RuntimeError("Hop-time search did not converge")
 
     def run(self, steps, dt, *, n_substeps=1, output=None):
         """Save completed frames and explicit failure status, including zero NAC."""

@@ -26,6 +26,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -308,6 +309,91 @@ class DriverTests(unittest.TestCase):
                 assert_allclose(state.density(),saved.density(),atol=0)
             self.assertEqual(run.time,accepted*.4)
             self.assertEqual(run.execution.time,run.time)
+
+
+class TullyExecution:
+    """Adiabatic double of an execution: Tully's simple avoided crossing along x (mass 2000)."""
+
+    def __init__(self, x):
+        self.x, self.time = float(x), 0.
+
+    @staticmethod
+    def adiabatic(x):
+        a, b, c, d = .01, 1.6, .005, 1.
+        v11, d11 = np.sign(x)*a*(1-np.exp(-b*abs(x))), a*b*np.exp(-b*abs(x))
+        v12 = c*np.exp(-d*x*x)
+        w = np.hypot(v11, v12)
+        dw = (v11*d11 - 2*d*x*v12*v12)/w
+        theta = .5*np.arctan2(v12, v11)
+        forces = np.zeros((2, 1, 3)); forces[:, 0, 0] = [dw, -dw]
+        return np.array([-w, w]), forces, np.array([[-np.sin(theta), np.cos(theta)], [np.cos(theta), np.sin(theta)]])
+
+    @property
+    def positions(self):
+        return np.array([[self.x, 0., 0.]])
+
+    def observe(self, *, forces=True):
+        energies, force, _ = self.adiabatic(self.x)
+        return SimpleNamespace(time=self.time, energies=energies, forces=force)
+
+    def snapshot(self):
+        return (self.x, self.time)
+
+    def restore(self, snapshot):
+        self.x, self.time = snapshot
+
+    def advance(self, end, dt, *, midpoint=None, n_substeps=1, forces=True):
+        old = self.adiabatic(self.x)[2]
+        self.x, self.time = float(end[0][0]), self.time + dt
+        return SimpleNamespace(observation=self.observe(), overlap_raw=old.T @ self.adiabatic(self.x)[2])
+
+
+class ReversibleHopTests(unittest.TestCase):
+    axis = SimpleNamespace(compute=lambda execution: SimpleNamespace(raw=np.array([[1., 0, 0]])))
+
+    def tully(self, dt, steps, tolerance, x=-1.5, p=16.16, spin=(.6, .2, -.77)):
+        spin = np.asarray(spin)/np.linalg.norm(spin)
+        run = Trajectory(TullyExecution(x), NuclearState([[x, 0, 0]], [[p, 0, 0]], [2000.]), method=MASH(spin),
+                         nac=self.axis, hop_tolerance=tolerance)
+        run.run(steps, dt)
+        return run
+
+    def retrace_error(self, forward, dt, steps, tolerance, x, p, spin):
+        back = self.tully(dt, steps, tolerance, forward.nuclei.positions[0, 0], -forward.nuclei.momenta[0, 0],
+                          forward.method.spin*[1, -1, 1])
+        return max(abs(back.nuclei.positions[0, 0]-x), abs(back.nuclei.momenta[0, 0]+p),
+                   np.abs(back.method.spin*[1, -1, 1]-np.asarray(spin)/np.linalg.norm(spin)).max())
+
+    def test_accepted_hop_is_located_inside_the_step_and_retraced(self):
+        for tolerance in (1e-8, None):
+            forward = self.tully(20., 20, tolerance)
+            self.assertEqual([e[4] for e in forward.hop_events], ["accepted"])
+            error = self.retrace_error(forward, 20., 20, tolerance, -1.5, 16.16, (.6, .2, -.77))
+            if tolerance is None:   # paper scheme: hop at the step end, not reversible
+                self.assertEqual(forward.hop_events[0][1] % 20., 0.)
+                self.assertGreater(error, 1e-3)
+            else:
+                self.assertGreater(abs(forward.hop_events[0][1]/20.-round(forward.hop_events[0][1]/20.)), 1e-3)
+                self.assertLess(error, 1e-8)
+
+    def test_rev_pc_is_second_order_through_an_accepted_hop(self):
+        reference = self.tully(.25, 1600, 1e-10)
+        errors = []
+        for dt in (10., 5., 2.5):
+            run = self.tully(dt, int(400/dt), 1e-8)
+            self.assertEqual(len(run.hop_events), 1)
+            errors.append(max(abs(run.nuclei.positions[0, 0]-reference.nuclei.positions[0, 0]),
+                              np.abs(run.method.spin-reference.method.spin).max()))
+        self.assertTrue(all(ratio > 3.5 for ratio in np.array(errors[:-1])/errors[1:]), errors)
+
+    def test_frustrated_pi_hops_retrace_and_tolerance_is_validated(self):
+        forward = self.tully(20., 30, 1e-8, p=6., spin=(.3, .95, -.1))
+        self.assertEqual({e[4] for e in forward.hop_events}, {"frustrated"})
+        self.assertLess(self.retrace_error(forward, 20., 30, 1e-8, -1.5, 6., (.3, .95, -.1)), 1e-8)
+        nuclei = NuclearState([[0, 0, 0]], [[0, 0, 0]], [2000.])
+        for method, tolerance in ((None, 1e-4), (MASH([0, 0, 1.]), 0.), (MASH([0, 0, 1.]), 1.), (MASH([0, 0, 1.]), np.nan)):
+            with self.assertRaises(ValueError):
+                Trajectory(TullyExecution(0.), nuclei, method=method, nac=self.axis, hop_tolerance=tolerance)
 
 
 if __name__ == "__main__":
