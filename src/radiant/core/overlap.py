@@ -20,8 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Restricted two-state DTO/singlet overlaps adapted from TDMASH v0.1.0.
+"""Two-state DTO/determinant overlaps adapted from TDMASH v0.1.0.
 
+A pair is either restricted (closed-shell ground, two-active-orbital singlet)
+or unrestricted (two single determinants with the same alpha and beta counts).
 Rows are old/minus states; columns are new/plus states. Same-time Gram
 matrices use the same formula but are diagnostics, never time couplings.
 """
@@ -50,8 +52,10 @@ def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
     aligns every orbital in both branches to the same central reference.
     """
     ground, excited = states
+    if len(ground.coefficients) == 2 and len(excited.coefficients) == 2:
+        return _unrestricted_pair(states, reference, cross, align_all)
     if len(ground.coefficients) != 1 or len(excited.coefficients) != 1:
-        raise ValueError("Unrestricted two-state DTO has not been validated")
+        raise ValueError("A DTO pair must be both restricted or both unrestricted")
     cg, ce = ground.coefficients[0], excited.coefficients[0].copy()
     fg, fe = ground.occupations[0], excited.occupations[0]
     if np.any(fg == 1) or np.sum(fe == 1) != 2 or np.sum(fg) != np.sum(fe):
@@ -73,9 +77,30 @@ def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
     return (OrbitalState((cg,), (fg,)), OrbitalState((ce,), (fe,)))
 
 
+def _unrestricted_pair(states, reference, cross, align_all):
+    """Occupied rotations change a determinant only by a phase: no hole/particle to order.
+
+    The orbitals stay as propagated; FD branches are phase-aligned to the central reference.
+    """
+    if _spin_counts(states[0]) != _spin_counts(states[1]):
+        raise ValueError("Unrestricted DTO states need equal alpha and beta electron counts")
+    if not align_all:
+        return tuple(s.copy() for s in states)
+    return tuple(OrbitalState(tuple(align_phases(c, r, cross) for c, r in zip(s.coefficients, ref.coefficients)),
+                              s.occupations) for s, ref in zip(states, reference))
+
+
+def _spin_counts(state):
+    if len(state.coefficients) == 2:
+        return tuple(float(np.sum(f)) for f in state.occupations)
+    return (float(np.sum(state.occupations[0])) / 2,) * 2
+
+
 def _determinants(state):
-    if len(state.coefficients) != 1:
-        raise ValueError("Only restricted singlet overlaps are supported")
+    """(alpha, beta, weight) determinants of a restricted singlet or one unrestricted determinant."""
+    if len(state.coefficients) == 2:
+        alpha, beta = (c[:, f == 1] for c, f in zip(state.coefficients, state.occupations))
+        return ((alpha, beta, 1.),)
     c, f = state.coefficients[0], state.occupations[0]
     closed, active = c[:, f == 2], c[:, f == 1]
     if active.shape[1] == 0:
@@ -88,9 +113,12 @@ def _determinants(state):
 
 
 def singlet_overlap(left, right, cross):
-    """Closed/open sqrt(2) and both open/open determinant products included."""
-    if np.sum(left.occupations[0]) != np.sum(right.occupations[0]):
-        raise ValueError("Singlet electron counts differ")
+    """Closed/open sqrt(2) and both open/open determinant products included.
+
+    An unrestricted state is one determinant of weight 1.
+    """
+    if _spin_counts(left) != _spin_counts(right):
+        raise ValueError("Alpha/beta electron counts differ")
     return sum(wl * wr * np.linalg.det(al.conj().T @ cross @ ar)
                * np.linalg.det(bl.conj().T @ cross @ br)
                for al, bl, wl in _determinants(left)

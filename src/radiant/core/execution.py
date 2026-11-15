@@ -48,7 +48,7 @@ class LocalExecution:
     def __init__(self, providers, states=None, *, alphas=None, options=CNOptions(), time=0.):
         self.providers = tuple(providers)
         if len(self.providers) not in (1, 2):
-            raise ValueError("Only one-state RT or two-state restricted DTO is supported")
+            raise ValueError("Only one-state RT or a two-state DTO pair is supported")
         self.states = tuple(p.initial_state() for p in self.providers) if states is None else tuple(s.copy() for s in states)
         if len(self.states) != len(self.providers):
             raise ValueError("Provider/state counts do not match")
@@ -111,11 +111,11 @@ class LocalExecution:
             raise ValueError("Snapshot belongs to another execution session")
 
     def overlap(self, left, right):
-        """Return only the two-state cross-geometry singlet overlap matrix."""
+        """Return only the two-state cross-geometry DTO overlap matrix."""
         self._validate_snapshot(left)
         self._validate_snapshot(right)
         if len(self.states) != 2:
-            raise ValueError("DTO overlap requires a restricted two-state pair")
+            raise ValueError("DTO overlap requires a two-state pair")
         from .overlap import pair_overlap
         cross = self.providers[0].cross_overlap(left.providers[0].mf.mol, right.providers[0].mf.mol)
         return pair_overlap(left.gauge, right.gauge, cross)

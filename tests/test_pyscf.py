@@ -170,3 +170,62 @@ class ZVectorNACTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnrestrictedPairTests(unittest.TestCase):
+    """NO2 X 2A1 / A 2B2 as two UKS determinants (beta HOMO b2 -> LUMO a1) at a C2v geometry."""
+
+    @classmethod
+    def setUpClass(cls):
+        half = np.radians(60)
+        mol = gto.M(atom=f"N 0 0 0; O {1.2*np.sin(half)} {1.2*np.cos(half)} 0; O {-1.2*np.sin(half)} {1.2*np.cos(half)} 0",
+                    basis="sto-3g", spin=1, verbose=0)
+
+        def uks():
+            mf = dft.UKS(mol); mf.xc = "pbe"; mf.grids.level = 1; mf.chkfile = None; mf.conv_tol = 1e-12
+            return mf
+        ground = uks(); ground.kernel()
+        occ = np.array(ground.mo_occ, dtype=float)
+        nb = int(occ[1].sum())
+        occ[1, nb-1], occ[1, nb] = 0, 1
+        excited = scf.addons.mom_occ(uks(), ground.mo_coeff, occ)
+        excited.kernel(dm0=excited.make_rdm1(ground.mo_coeff, occ))
+        assert ground.converged and excited.converged and np.array_equal(excited.mo_occ, occ)
+        cls.mfs = (ground, excited)
+
+    def execution(self):
+        return LocalExecution([PySCFProvider(mf) for mf in self.mfs])
+
+    def test_paper_fd_coupling_has_the_b2_symmetry(self):
+        from radiant.core.coupling import PaperFD
+        run = self.execution()
+        now = run.snapshot()
+        gram = run.overlap(now, now)
+        assert_allclose(gram, np.eye(2), atol=1e-6, rtol=0)  # A1 and B2 determinants are orthogonal
+        # The imaginary part (~1% here) is CN-tolerance noise: 1e-6 over a 0.02 bohr FD interval.
+        raw = PaperFD().compute(run).raw.real
+        self.assertGreater(np.linalg.norm(raw), 1e-2)
+        # C2(y) swaps the O atoms and maps (x, y, z) -> (-x, y, -z); A1 x B2 is odd under it
+        assert_allclose(raw[[0, 2, 1]], raw*[1, -1, 1], atol=1e-5*np.linalg.norm(raw), rtol=0)
+        assert_allclose(raw[:, 2], 0, atol=1e-5*np.linalg.norm(raw), rtol=0)
+
+    def test_gauge_alignment_and_rejected_pairs(self):
+        from radiant.core.overlap import dto_pair
+        run = self.execution()
+        central = run.gauge
+        rng = np.random.default_rng(11)
+        phased = tuple(OrbitalState(tuple(c*np.exp(2j*np.pi*rng.random(c.shape[1])) for c in s.coefficients),
+                                    s.occupations) for s in run.states)
+        overlap = run.providers[0].overlap
+        for a, b in zip(dto_pair(phased, overlap, reference=central, cross=overlap, align_all=True), central):
+            for ca, cb in zip(a.coefficients, b.coefficients):
+                assert_allclose(ca, cb, atol=1e-12, rtol=0)
+        ground, excited = run.states
+        fewer = OrbitalState((excited.coefficients[0][:, :-1], excited.coefficients[1]),
+                             (excited.occupations[0][:-1], excited.occupations[1]))
+        restricted = OrbitalState((ground.coefficients[0],), (2*ground.occupations[0],))
+        for pair in ((ground, fewer), (restricted, excited)):
+            with self.assertRaises(ValueError):
+                dto_pair(pair, overlap)
+        with self.assertRaises(ValueError):
+            ZVectorNAC().compute(run)
