@@ -1,6 +1,7 @@
 """Native PySCF and independent fixed-X energy differences; PySCF is required."""
 
 from copy import deepcopy
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -8,6 +9,8 @@ from numpy.testing import assert_allclose
 from pyscf import dft, gto, scf
 
 from radiant.backends.pyscf import PySCFProvider
+from radiant.backends.pyscf_nac import ZVectorNAC
+from radiant.core.execution import LocalExecution
 from radiant.core.propagation import CNOptions, crank_nicolson
 from radiant.core.state import OrbitalState
 from radiant.core.transport import lowdin, transport
@@ -131,6 +134,38 @@ class PySCFTests(unittest.TestCase):
                     trial.prepare_geometry(positions)
                     energies.append(trial.energy(transport(state,overlap,trial.overlap)))
                 assert_allclose(force[0,axis],-(energies[0]-energies[1])/2e-4,atol=2e-7,rtol=0)
+
+
+class ZVectorNACTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with np.load(Path(__file__).parent/"fixtures/table1_recomputed.npz",allow_pickle=False) as fixture:
+            cls.fixture=dict(fixture)
+        mol=gto.M(atom=list(zip(("N","N","H","H"),cls.fixture["positions_bohr"])),
+                  basis="6-31g*",unit="Bohr",verbose=0)
+        cls.mf=scf.RHF(mol);cls.mf.chkfile=None;cls.mf.kernel()
+        cls.states=tuple(OrbitalState((cls.fixture[name+"_coeff"],),(cls.fixture[name+"_occ"],))
+                         for name in ("ground","excited"))
+
+    def execution(self,states,convention="paper_real"):
+        return LocalExecution([PySCFProvider(self.mf,density_convention=convention) for _ in states],states)
+
+    def test_table1_static_direction_and_state_phases(self):
+        result=ZVectorNAC().compute(self.execution(self.states))
+        self.assertGreater(np.sum(result.real_direction*self.fixture["static_direction"]),1-1e-7)
+        rng=np.random.default_rng(7)
+        phased=tuple(OrbitalState((s.coefficients[0]*np.exp(2j*np.pi*rng.random(s.coefficients[0].shape[1])),),
+                                  s.occupations) for s in self.states)
+        raw=ZVectorNAC().compute(self.execution(phased)).raw
+        phase=np.vdot(result.raw,raw)/np.vdot(result.raw,result.raw)
+        assert_allclose(abs(phase),1.,atol=1e-10,rtol=0)
+        assert_allclose(raw,phase*result.raw,atol=1e-10*np.linalg.norm(raw),rtol=0)
+
+    def test_energy_must_depend_on_real_density_only(self):
+        with self.assertRaises(ValueError):
+            ZVectorNAC().compute(self.execution(self.states,"complex"))
+        with self.assertRaises(ValueError):
+            ZVectorNAC(tolerance=0.)
 
 
 if __name__ == "__main__":
