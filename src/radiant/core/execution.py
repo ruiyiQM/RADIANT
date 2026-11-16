@@ -105,13 +105,19 @@ class LocalExecution:
         forces=True/False keeps the all/none interface; a tuple selects states.
         """
         indices = _force_states(forces, len(self.states))
-        energies = np.array([p.energy(s) for p, s in zip(self.providers, self.states)])
+        energies = np.empty(len(self.states))
         force = np.full((len(self.states), *self.positions.shape), np.nan) if indices else None
-        for i in indices:
-            value = np.asarray(self.providers[i].forces(self.states[i]))
-            if value.shape != self.positions.shape or np.iscomplexobj(value):
-                raise ValueError("Endpoint force must be a real nuclear-coordinate array")
-            force[i] = value
+        for i, (provider, state) in enumerate(zip(self.providers, self.states)):
+            if hasattr(provider, "evaluate"):
+                energies[i], value = provider.evaluate(state, forces=i in indices)
+            else:
+                energies[i] = provider.energy(state)
+                value = provider.forces(state) if i in indices else None
+            if i in indices:
+                value = np.asarray(value)
+                if value.shape != self.positions.shape or np.iscomplexobj(value):
+                    raise ValueError("Endpoint force must be a real nuclear-coordinate array")
+                force[i] = value
         if not np.isfinite(energies).all() or (indices and not np.isfinite(force[list(indices)]).all()):
             raise ValueError("Non-finite endpoint observation")
         return Observation(self.time, energies, force)

@@ -94,6 +94,11 @@ class GPUProviderContractTests(unittest.TestCase):
                 expected = cpu.fock(state.density())
                 assert_allclose(provider.fock(state.density()), expected, atol=1e-12, rtol=0)
                 self.assertAlmostEqual(provider.energy(state), cpu.energy(state), places=12)
+                with patch.object(provider._gpu_mf, 'get_veff', wraps=provider._gpu_mf.get_veff) as potential:
+                    energy, force = provider.evaluate(state)
+                    self.assertEqual(potential.call_count, 1)
+                self.assertAlmostEqual(energy, cpu.energy(state), places=12)
+                assert_allclose(force, cpu.forces(state), atol=1e-12, rtol=0)
                 self.assertEqual(convert.call_count, 1)
                 cached = provider._gpu_mf
                 with patch.object(cached, "__deepcopy__", side_effect=AssertionError("device cache copied"), create=True):

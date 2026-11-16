@@ -116,18 +116,29 @@ class PySCFProvider:
         dm = self._density(density)
         return self.mf.get_hcore() + self.mf.get_veff(dm=dm)
 
-    def energy(self, state):
+    def energy(self, state, *, hcore=None, potential=None):
         dm = self._density(state.density())
-        return float(self.mf.energy_tot(dm=dm).real)
+        return float(self.mf.energy_tot(dm=dm, h1e=hcore, vhf=potential).real)
 
-    def forces(self, state):
+    def evaluate(self, state, *, forces=True):
+        """Share the endpoint potential between energy and fixed-X forces."""
+        if not forces:
+            return self.energy(state), None
+        dm = self._density(state.density())
+        hcore = self.mf.get_hcore()
+        potential = self.mf.get_veff(dm=dm)
+        return (self.energy(state, hcore=hcore, potential=potential),
+                self.forces(state, fock=hcore + potential))
+
+    def forces(self, state, *, fock=None):
         """Negative dE/dR at fixed X=S**(1/2) C, including DFT grid response.
 
         PySCF's real AO derivative JK routine needs separate real/imaginary
         contractions; passing a complex density directly silently drops it.
         """
         dm0 = self._density(state.density())
-        fock = self.fock(dm0)
+        if fock is None:
+            fock = self.fock(dm0)
         dm = dm0 if self.unrestricted else dm0[None]
         focks = fock if self.unrestricted else fock[None]
         grad = self.mf.nuc_grad_method()

@@ -3,6 +3,7 @@
 from copy import deepcopy
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_allclose
@@ -32,6 +33,21 @@ def mean_field(kind, *, open_shell=False):
 
 
 class PySCFTests(unittest.TestCase):
+    def test_shared_endpoint_evaluates_potential_once_for_complex_states(self):
+        from test_gpu_provider import complex_state
+        for kind in ('rhf','rks','uhf','uks'):
+            with self.subTest(kind=kind):
+                provider=PySCFProvider(mean_field(kind))
+                state=complex_state(provider)
+                energy,force=provider.energy(state),provider.forces(state)
+                with patch.object(provider.mf,'get_veff',wraps=provider.mf.get_veff) as potential:
+                    actual_energy,actual_force=provider.evaluate(state)
+                    self.assertEqual(potential.call_count,1)
+                self.assertAlmostEqual(actual_energy,energy,places=12)
+                assert_allclose(actual_force,force,atol=1e-12,rtol=0)
+                with patch.object(provider,'forces',side_effect=AssertionError('unrequested force')):
+                    self.assertEqual(provider.evaluate(state,forces=False),(energy,None))
+
     def test_native_complex_fock_energy_and_fixed_x_forces(self):
         for kind in ("rhf", "rks", "uhf", "uks"):
             with self.subTest(kind=kind):

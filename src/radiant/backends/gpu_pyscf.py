@@ -58,9 +58,22 @@ class GPU4PySCFProvider(PySCFProvider):
         potential = mean_field.get_veff(dm=cupy.asarray(density.real, order="C"))
         return self.mf.get_hcore() + cupy.asnumpy(potential)
 
-    def energy(self, state):
+    def energy(self, state, *, hcore=None, potential=None):
         density = self._density(state.density())
         import cupy
         mean_field = self._gpu_mean_field(density.real)
+        if hcore is None:
+            hcore = cupy.asarray(self.mf.get_hcore())
         return float(mean_field.energy_tot(dm=cupy.asarray(density.real, order="C"),
-                                          h1e=cupy.asarray(self.mf.get_hcore())))
+                                          h1e=hcore, vhf=potential))
+
+    def evaluate(self, state, *, forces=True):
+        if not forces:
+            return self.energy(state), None
+        density = self._density(state.density())
+        import cupy
+        mean_field = self._gpu_mean_field(density.real)
+        hcore = self.mf.get_hcore()
+        potential = mean_field.get_veff(dm=cupy.asarray(density.real, order="C"))
+        return (self.energy(state, hcore=cupy.asarray(hcore), potential=potential),
+                self.forces(state, fock=hcore + cupy.asnumpy(potential)))
