@@ -210,8 +210,8 @@ class Trajectory:
             tau = roots[0] if roots else .5 * (low + high)
         raise RuntimeError("Hop-time search did not converge")
 
-    def run(self, steps, dt, *, n_substeps=1, output=None):
-        """Save completed frames and explicit failure status, including zero NAC."""
+    def run(self, steps, dt, *, n_substeps=1, output=None, checkpoint=None):
+        """Save accepted frames and, when requested, an atomic restart after each step."""
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
             raise ValueError("steps must be a nonnegative integer")
         if (not np.isfinite(dt) or dt <= 0 or not isinstance(n_substeps, int)
@@ -219,12 +219,19 @@ class Trajectory:
                 or (self.nuclear_dt is not None and dt != self.nuclear_dt)):
             raise ValueError("Require the fixed positive nuclear dt and a positive integer substep count")
         requested = len(self.frames) + steps
+        if checkpoint is not None:
+            from .restart import save_checkpoint
+            save_checkpoint(self, checkpoint)
         try:
             for _ in range(steps):
                 self.step(dt, n_substeps=n_substeps, output=output, requested_steps=requested)
+                if checkpoint is not None:
+                    save_checkpoint(self, checkpoint)
         except BaseException as exc:
             if output is not None and not isinstance(exc, OSError):
                 self.save(output, requested_steps=requested)
+            if checkpoint is not None and not isinstance(exc, OSError):
+                save_checkpoint(self, checkpoint)
             raise
         if steps == 0 and output is not None:
             self.save(output, requested_steps=requested)
