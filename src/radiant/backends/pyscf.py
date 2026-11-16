@@ -177,7 +177,7 @@ class PySCFProvider:
         dm = density if self.unrestricted else density[None]
         focks = fock if self.unrestricted else fock[None]
         overlap = self.overlap
-        metric_density = sum(lowdin_pulay(overlap, d, h) for d, h in zip(dm, focks))
+        metric_density = lowdin_pulay(overlap, dm, focks)
         grad = self.mf.nuc_grad_method()
         hcore_deriv = grad.hcore_generator(self.mf.mol)
         s1 = grad.get_ovlp(self.mf.mol)

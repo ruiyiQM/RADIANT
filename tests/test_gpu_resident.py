@@ -5,6 +5,7 @@ from importlib.util import find_spec
 from itertools import product
 from pathlib import Path
 import sys
+import os
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -28,6 +29,43 @@ from test_restart import make_run
 
 
 class ResidentContractTests(unittest.TestCase):
+    def test_incremental_potential_owns_density_and_failed_build_keeps_cache(self):
+        provider=GPUResidentProvider(mean_field())
+        from unittest.mock import Mock
+        first=SimpleNamespace(vj=np.eye(2),ecoul=1.)
+        second=SimpleNamespace(vj=2*np.eye(2),ecoul=2.)
+        native=SimpleNamespace(direct_scf=True,get_veff=Mock(side_effect=[first,second,RuntimeError('J failure')]))
+        provider._gpu_mf=native
+        dm=np.eye(2)
+        self.assertIs(provider._potential(dm,incremental=True),first)
+        dm[0,0]=2
+        self.assertIs(provider._potential(dm,incremental=True),second)
+        a,b=native.get_veff.call_args_list
+        self.assertNotIn('dm_last',a.kwargs)
+        assert_allclose(b.kwargs['dm_last'],np.eye(2))
+        self.assertIs(b.kwargs['vhf_last'].vj,first.vj)
+        self.assertFalse(hasattr(b.kwargs['vhf_last'],'ecoul'))
+        with self.assertRaisesRegex(RuntimeError,'J failure'):
+            provider._potential(dm+1,incremental=True)
+        self.assertIs(native._radiant_potential.vj,second.vj)
+        assert_allclose(native._radiant_density,dm)
+        self.assertIsNone(deepcopy(provider)._gpu_mf)
+        native.direct_scf=False;native.get_veff=Mock(return_value=first)
+        provider._potential(dm,incremental=True)
+        self.assertNotIn('dm_last',native.get_veff.call_args.kwargs)
+        native.direct_scf=True;native.get_veff.reset_mock()
+        provider._potential(dm,incremental=False)
+        for _ in range(40):provider._potential(dm,incremental=True)
+        full_builds=sum('dm_last' not in call.kwargs for call in native.get_veff.call_args_list)
+        self.assertGreaterEqual(full_builds,3)
+
+    def test_high_angular_momentum_cannot_fall_back_to_cpu(self):
+        from pyscf import gto
+        mf=mean_field();mf.mol._bas[0,gto.ANG_OF]=5
+        with patch.dict(sys.modules,{'cupy':None,'gpu4pyscf':None}):
+            with self.assertRaisesRegex(ValueError,'angular momentum'):
+                GPUResidentProvider(mf)
+
     def test_failed_grid_export_preserves_complete_host_cache(self):
         provider = GPUResidentProvider(mean_field())
         grids = provider.mf.grids
@@ -50,6 +88,47 @@ class ResidentContractTests(unittest.TestCase):
 
 @unittest.skipUnless(find_spec('cupy') and find_spec('gpu4pyscf'),'Requires a real GPU')
 class ResidentHardwareTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('RADIANT_TEST_DEVICE_J_PATCH')=='1',
+                         'Requires the bundled isolated GPU4PySCF device-J patch')
+    def test_patched_coulomb_transform_receives_device_tensor(self):
+        import cupy as cp
+        from gpu4pyscf.scf import j_engine
+        original=j_engine._Rt_to_dm
+        calls=[]
+        def device_transform(mol,tensor,*args,**kwargs):
+            self.assertIsInstance(tensor,cp.ndarray)
+            calls.append(tensor.shape)
+            return original(mol,tensor,*args,**kwargs)
+        for unrestricted in (False,True):
+            mf=mean_field(unrestricted);provider=GPUResidentProvider(mf)
+            state=provider.initial_state()
+            with patch.object(j_engine,'_Rt_to_dm',device_transform):
+                actual=provider.fock(state.density())
+            expected=PySCFProvider(mf).fock(to_host(state.density()))
+            assert_allclose(to_host(actual),expected,atol=2e-9,rtol=0)
+        self.assertEqual(len(calls),2)
+
+    def test_incremental_fock_matches_full_rebuild_and_geometry_reset(self):
+        import cupy as cp
+        for unrestricted in (False,True):
+            provider=GPUResidentProvider(mean_field(unrestricted))
+            initial=provider.initial_state().density()
+            other=complex_state(PySCFProvider(provider.mf)).density()
+            other=cp.asarray(other)
+            for weight in (.1,.01,.001,.0001,0.,.05)*7:
+                density=(1-weight)*initial+weight*other
+                actual=provider.fock(density)
+                expected=provider.hcore+provider._gpu_mean_field().get_veff(dm=density.real)
+                assert_allclose(to_host(actual),to_host(expected),atol=2e-9,rtol=0)
+            native=provider._gpu_mf
+            moved=provider.positions;moved[0,0]+=.001
+            provider.prepare_geometry(moved)
+            self.assertIsNot(provider._gpu_mf,native)
+            self.assertIsNone(provider._gpu_mf._radiant_potential)
+            actual=provider.fock(initial)
+            expected=provider.hcore+provider._gpu_mean_field().get_veff(dm=initial.real)
+            assert_allclose(to_host(actual),to_host(expected),atol=2e-9,rtol=0)
+
     def test_response_ao_derivatives_and_complex_nac_match_cpu(self):
         import cupy as cp
         for unrestricted, xc in product((False, True), ('lda,vwn', 'pbe')):
@@ -104,7 +183,11 @@ class ResidentHardwareTests(unittest.TestCase):
                     self.assertTrue(all(isinstance(c,cp.ndarray) for c in resident.coefficients))
                     assert_allclose(cp.asnumpy(gpu.overlap),cpu.overlap,atol=2e-11,rtol=0)
                     assert_allclose(cp.asnumpy(gpu.fock(resident.density())),cpu.fock(state.density()),atol=2e-8,rtol=0)
-                    energy,force=gpu.evaluate(resident)
+                    with patch.object(OrbitalState,'density',autospec=True,side_effect=OrbitalState.density) as build, \
+                            patch.object(gpu,'_density',wraps=gpu._density) as validate:
+                        energy,force=gpu.evaluate(resident)
+                    self.assertEqual(build.call_count,1)
+                    self.assertEqual(validate.call_count,1)
                     self.assertAlmostEqual(energy,cpu.energy(state),delta=2e-8)
                     assert_allclose(force,cpu.forces(state),atol=2e-8,rtol=0)
                     values=[]
@@ -157,9 +240,13 @@ class ResidentHardwareTests(unittest.TestCase):
                 resumed=load_checkpoint(path,[GPUResidentProvider(mf),GPUResidentProvider(mf)])
                 self.assertTrue(all(isinstance(c,cp.ndarray) for s in resumed.execution.states for c in s.coefficients))
                 before=resumed.execution.snapshot()
-                with patch.object(GPUResidentProvider,'fock',side_effect=RuntimeError('device failure')):
-                    with self.assertRaisesRegex(RuntimeError,'device failure'):resumed.run(1,.02)
-                self.assertEqual(resumed.execution.time,before.time)
+                for failing in ('fock','_forces'):
+                    with patch.object(GPUResidentProvider,failing,side_effect=RuntimeError('device failure')):
+                        with self.assertRaisesRegex(RuntimeError,'device failure'):resumed.run(1,.02)
+                    self.assertEqual(resumed.execution.time,before.time)
+                    self.assertIsNone(resumed.execution.providers[0]._gpu_mf)
+                    for a,b in zip(resumed.execution.states,before.states):
+                        assert_allclose(to_host(a.density()),to_host(b.density()),atol=2e-14,rtol=0)
                 resumed.run(2,.02,checkpoint=path)
                 assert_allclose(resumed.nuclei.positions,full.nuclei.positions,atol=2e-9,rtol=0)
                 assert_allclose(resumed.nuclei.momenta,full.nuclei.momenta,atol=2e-9,rtol=0)

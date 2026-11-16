@@ -29,13 +29,33 @@ import numpy as np
 from numpy.testing import assert_allclose
 from scipy.integrate import solve_ivp
 from scipy.linalg import expm
+from unittest.mock import patch
 
 from radiant.core.propagation import CNOptions, StepFailure, crank_nicolson
 from radiant.core.state import NuclearState, OrbitalState
-from radiant.core.transport import lowdin, transport
+from radiant.core.transport import lowdin, lowdin_pulay, transport
 
 
 class PropagationTests(unittest.TestCase):
+    def test_spin_pulay_reuses_metric_and_matches_fixed_x_energy_difference(self):
+        rng = np.random.default_rng(37)
+        a = rng.normal(size=(4,4));s = a@a.T + np.eye(4)
+        inverse, _ = lowdin(s)
+        x = rng.normal(size=(2,4,2)) + 1j*rng.normal(size=(2,4,2))
+        densities = inverse @ (x @ x.conj().transpose(0,2,1)) @ inverse
+        focks = rng.normal(size=(2,4,4)) + 1j*rng.normal(size=(2,4,4))
+        focks += focks.conj().transpose(0,2,1)
+        direction = rng.normal(size=(4,4));direction += direction.T
+        with patch.object(np.linalg,'eigh',wraps=np.linalg.eigh) as diagonalize:
+            metric = lowdin_pulay(s,densities,focks)
+        self.assertEqual(diagonalize.call_count,1)
+        values=[];h=1e-5
+        for sign in (1,-1):
+            inv=lowdin(s+sign*h*direction)[0]
+            dm=inv @ (x @ x.conj().transpose(0,2,1)) @ inv
+            values.append(np.einsum('sij,sji->',focks,dm).real)
+        self.assertAlmostEqual((values[0]-values[1])/(2*h),-np.trace(metric@direction).real,delta=2e-7)
+
     def test_both_variants_match_explicit_cayley_and_signed_reverse(self):
         s = np.array([[1., .2], [.2, 1.3]])
         inv, _ = lowdin(s)

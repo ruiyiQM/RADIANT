@@ -35,9 +35,12 @@ def lowdin_pulay(overlap, density, fock):
 
     Differentiating S**(-1/2) uses the Sylvester derivative of S**(1/2).
     This is distinct from the stationary SCF energy-weighted density.
+    A stack of spin densities/Focks shares one metric solve and returns their sum.
     """
     inverse, half = lowdin(overlap)
     rhs = density @ fock @ inverse + inverse @ fock @ density
+    if rhs.ndim == 3:
+        rhs = rhs.sum(axis=0)
     xp = array_module(overlap)
     if xp is np:
         return solve_sylvester(half, half, rhs)

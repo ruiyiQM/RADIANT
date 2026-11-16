@@ -1,0 +1,19 @@
+--- a/gpu4pyscf/scf/j_engine.py
++++ b/gpu4pyscf/scf/j_engine.py
+@@ -243,7 +243,6 @@
+             jk._TimingCollector.summary(log.debug1, (x[2] for x in results))
+
+         vj_xyz = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
+-        vj_xyz = vj_xyz.get()
+
+         h_shls = self.h_shls
+         if h_shls:
+@@ -421,7 +420,7 @@
+     ao_loc = mol.ao_loc
+     nao = ao_loc[-1]
+     dm_ndim = dm_xyz.ndim
+-    dm_xyz_size = int(pair_loc[-1])
++    dm_xyz_size = dm_xyz.shape[-1]
+     dm_xyz = dm_xyz.reshape(-1,dm_xyz_size)
+     n_dm = len(dm_xyz)
+     out = ndarray((n_dm, nao, nao), buffer=out)

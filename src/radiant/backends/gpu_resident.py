@@ -2,9 +2,12 @@
 
 Electronic matrices stay on device during dynamics. Model/grid initialization
 metadata, small endpoint results and persistent checkpoints remain host boundaries.
+The bundled GPU4PySCF 1.9.2 patch must be applied separately to remove that
+library's Hermite-Coulomb tensor host round trip.
 """
 
 from copy import copy, deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 from pyscf import gto
@@ -20,6 +23,8 @@ class GPUResidentProvider(GPU4PySCFProvider):
 
     def __init__(self, mean_field, *, density_convention="complex"):
         super().__init__(mean_field, density_convention=density_convention, gpu_forces=True)
+        if np.max(self.mf.mol._bas[:, gto.ANG_OF], initial=0) > 4:
+            raise ValueError("Resident Coulomb integrals require angular momentum l <= 4")
         self._device_overlap = self._device_hcore = None
         self._device_nuclear = None
 
@@ -77,6 +82,7 @@ class GPUResidentProvider(GPU4PySCFProvider):
             native.nlcgrids = self._gpu_mf.nlcgrids.copy()
             native._numint = copy(self._gpu_mf._numint)
             native.reset(mol)
+            native._radiant_density = native._radiant_potential = None
         self.mf, self._gpu_mf = candidate, native
         self._device_overlap = self._device_hcore = self._device_nuclear = None
         try:
@@ -98,8 +104,10 @@ class GPUResidentProvider(GPU4PySCFProvider):
             raise ValueError("Resident Focks require a device density")
         n = self.mf.mol.nao
         shape = (2, n, n) if self.unrestricted else (n, n)
-        if (density.shape != shape or not xp.isfinite(density).all() or
-                not xp.allclose(density, density.conj().swapaxes(-1, -2), atol=1e-12, rtol=0)):
+        if density.shape != shape:
+            raise ValueError("Density must be finite and Hermitian with the model's spin shape")
+        if not (xp.isfinite(density).all() &
+                xp.allclose(density, density.conj().swapaxes(-1, -2), atol=1e-12, rtol=0)):
             raise ValueError("Density must be finite and Hermitian with the model's spin shape")
         return density.real if self.density_convention == "paper_real" else density
 
@@ -107,7 +115,24 @@ class GPUResidentProvider(GPU4PySCFProvider):
         if not np.isfinite(time):
             raise ValueError("Physical time must be finite")
         density = self._density(density)
-        return self.hcore + self._gpu_mean_field().get_veff(dm=density.real)
+        return self.hcore + self._potential(density.real, incremental=True)
+
+    def _potential(self, density, *, incremental):
+        # J is linear; only its density increment is screened, while XC sees the full density.
+        native = self._gpu_mean_field()
+        previous = getattr(native, "_radiant_potential", None)
+        updates = getattr(native, "_radiant_updates", 0)
+        kwargs = {}
+        # Bound screening-error accumulation in long fixed-geometry electronic runs.
+        if incremental and native.direct_scf and previous is not None and updates < 16:
+            kwargs = dict(dm_last=native._radiant_density, vhf_last=previous)
+        potential = native.get_veff(dm=density, **kwargs)
+        # Iteration needs J, not its energy; omitting ecoul avoids a scalar download.
+        cached_density = density.copy()
+        cached_j = SimpleNamespace(vj=potential.vj)
+        native._radiant_density, native._radiant_potential = cached_density, cached_j
+        native._radiant_updates = updates + 1 if kwargs else 0
+        return potential
 
     def _nuclear(self):
         if self._device_nuclear is None:
@@ -123,9 +148,12 @@ class GPUResidentProvider(GPU4PySCFProvider):
         return self._device_nuclear
 
     def energy(self, state, *, hcore=None, potential=None):
-        density = self._density(state.density()).real
+        return self._energy(self._density(state.density()), hcore=hcore, potential=potential)
+
+    def _energy(self, density, *, hcore=None, potential=None):
+        density = density.real
         if potential is None:
-            potential = self._gpu_mean_field().get_veff(dm=density)
+            potential = self._potential(density, incremental=False)
         hcore = self.hcore if hcore is None else hcore
         total = density.sum(axis=0) if self.unrestricted else density
         one = self.array_module.einsum("ij,ji->", hcore, total).real
@@ -133,18 +161,21 @@ class GPUResidentProvider(GPU4PySCFProvider):
 
     def evaluate(self, state, *, forces=True):
         density = self._density(state.density())
-        potential = self._gpu_mean_field().get_veff(dm=density.real)
-        energy = self.energy(state, hcore=self.hcore, potential=potential)
-        force = self.forces(state, fock=self.hcore + potential) if forces else None
+        potential = self._potential(density.real, incremental=False)
+        energy = self._energy(density, hcore=self.hcore, potential=potential)
+        force = self._forces(density, fock=self.hcore + potential) if forces else None
         return energy, force
 
     def forces(self, state, *, fock=None):
-        xp = self.array_module
         density = self._density(state.density())
-        fock = self.fock(density) if fock is None else fock
+        fock = self.hcore + self._potential(density.real, incremental=False) if fock is None else fock
+        return self._forces(density, fock=fock)
+
+    def _forces(self, density, *, fock):
+        xp = self.array_module
         dms = density if self.unrestricted else density[None]
         focks = fock if self.unrestricted else fock[None]
-        metric = sum(lowdin_pulay(self.overlap, d, h) for d, h in zip(dms, focks))
+        metric = lowdin_pulay(self.overlap, dms, focks)
         gradient = self._gpu_mean_field().nuc_grad_method()
         gradient.grid_response = True
         core = gradient._hcore_energy(dms.real.sum(axis=0), metric.real)
