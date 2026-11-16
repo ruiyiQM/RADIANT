@@ -94,7 +94,9 @@ class GPUProviderContractTests(unittest.TestCase):
                 expected = cpu.fock(state.density())
                 assert_allclose(provider.fock(state.density()), expected, atol=1e-12, rtol=0)
                 self.assertAlmostEqual(provider.energy(state), cpu.energy(state), places=12)
-                with patch.object(provider._gpu_mf, 'get_veff', wraps=provider._gpu_mf.get_veff) as potential:
+                with patch.object(provider, 'forces', side_effect=lambda state, **kw:
+                                  PySCFProvider.forces(provider, state, **kw)), patch.object(
+                        provider._gpu_mf, 'get_veff', wraps=provider._gpu_mf.get_veff) as potential:
                     energy, force = provider.evaluate(state)
                     self.assertEqual(potential.call_count, 1)
                 self.assertAlmostEqual(energy, cpu.energy(state), places=12)
@@ -136,6 +138,21 @@ class GPUProviderHardwareTests(unittest.TestCase):
         cls.mean_fields = [mean_field(unrestricted, xc)
                            for unrestricted in (False, True) for xc in ("lda,vwn", "pbe")]
 
+    def test_gradient_device_failure_rolls_back_without_cpu_fallback(self):
+        mf = self.mean_fields[0]
+        execution = LocalExecution([GPU4PySCFProvider(mf)])
+        execution.observe()
+        before = execution.snapshot()
+        moved = execution.positions.copy(); moved[0, 0] += .001
+        gradient_class = type(execution.providers[0]._gpu_mf.nuc_grad_method())
+        with patch.object(gradient_class, 'energy_ee', side_effect=RuntimeError('device gradient failure')), \
+                patch.object(PySCFProvider, 'forces', side_effect=AssertionError('CPU fallback')):
+            with self.assertRaisesRegex(RuntimeError, 'device gradient'):
+                execution.advance(moved, .02)
+        self.assertEqual(execution.time, before.time)
+        assert_allclose(execution.positions, before.providers[0].positions, atol=0, rtol=0)
+        assert_allclose(execution.states[0].density(), before.states[0].density(), atol=0, rtol=0)
+
     def test_complex_fock_energy_and_moving_fixed_x_forces(self):
         import cupy
         for mf in self.mean_fields:
@@ -153,6 +170,9 @@ class GPUProviderHardwareTests(unittest.TestCase):
                     assert_allclose(gpu.fock(moved.density()), cpu.fock(moved.density()), atol=2e-8, rtol=0)
                     self.assertAlmostEqual(gpu.energy(moved), cpu.energy(moved), delta=2e-8)
                     assert_allclose(gpu.forces(moved), cpu.forces(moved), atol=2e-8, rtol=0)
+                    energy, force = gpu.evaluate(moved)
+                    self.assertAlmostEqual(energy, cpu.energy(moved), delta=2e-8)
+                    assert_allclose(force, cpu.forces(moved), atol=2e-8, rtol=0)
                     assert_allclose(cupy.asnumpy(gpu._gpu_mf.grids.coords), cpu.mf.grids.coords, atol=0, rtol=0)
                     energies = []
                     for sign in (1, -1):

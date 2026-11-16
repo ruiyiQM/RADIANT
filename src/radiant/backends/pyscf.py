@@ -140,7 +140,6 @@ class PySCFProvider:
         if fock is None:
             fock = self.fock(dm0)
         dm = dm0 if self.unrestricted else dm0[None]
-        focks = fock if self.unrestricted else fock[None]
         grad = self.mf.nuc_grad_method()
         log = logger.new_logger(grad)
         if isinstance(self.mf, dft.rks.KohnShamDFT):
@@ -164,19 +163,29 @@ class PySCFProvider:
             derivative = np.asarray(vhf, dtype=complex).reshape(imaginary.shape) + 1j * imaginary
         else:
             derivative = np.asarray(vhf).reshape((len(dm), 3, *dm0.shape[-2:]))
-        metric_density = sum(lowdin_pulay(self.overlap, d, h) for d, h in zip(dm, focks))
-        hcore_deriv = grad.hcore_generator(self.mf.mol)
-        s1 = grad.get_ovlp(self.mf.mol)
         de = np.zeros((self.mf.mol.natm, 3))
         for ia, (_, _, p0, p1) in enumerate(self.mf.mol.aoslice_by_atom()):
-            de[ia] += np.einsum("xij,ji->x", hcore_deriv(ia), dm.sum(axis=0)).real
             de[ia] += 2 * np.einsum("sxij,sji->x", derivative[:, :, p0:p1], dm[:, :, p0:p1]).real
-            de[ia] -= 2 * np.einsum("xij,ji->x", s1[:, p0:p1], metric_density[:, p0:p1]).real
             de[ia] += grad.extra_force(ia, locals())
-        result = -(de + grad.grad_nuc())
+        result = -(de + self._one_electron_gradient(dm0, fock))
         if not np.isfinite(result).all():
             raise ValueError("Non-finite fixed-X force")
         return result
+
+    def _one_electron_gradient(self, density, fock):
+        """Core, nuclear and fixed-X metric terms shared by CPU/GPU derivatives."""
+        dm = density if self.unrestricted else density[None]
+        focks = fock if self.unrestricted else fock[None]
+        overlap = self.overlap
+        metric_density = sum(lowdin_pulay(overlap, d, h) for d, h in zip(dm, focks))
+        grad = self.mf.nuc_grad_method()
+        hcore_deriv = grad.hcore_generator(self.mf.mol)
+        s1 = grad.get_ovlp(self.mf.mol)
+        de = grad.grad_nuc()
+        for ia, (_, _, p0, p1) in enumerate(self.mf.mol.aoslice_by_atom()):
+            de[ia] += np.einsum("xij,ji->x", hcore_deriv(ia), dm.sum(axis=0)).real
+            de[ia] -= 2 * np.einsum("xij,ji->x", s1[:, p0:p1], metric_density[:, p0:p1]).real
+        return de
 
     @staticmethod
     def cross_overlap(left_mol, right_mol):

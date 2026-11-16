@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Ruiyi Zhou
-"""GPU4PySCF Fock/energy for pure molecular LDA/GGA, with CPU fixed-X forces.
+"""GPU4PySCF Fock, energy and two-electron forces for pure molecular LDA/GGA.
 
-Accept a converged CPU RKS/UKS object. Orbitals, propagation, overlap and NAC
-remain on the CPU. CuPy and GPU4PySCF are needed only at the first evaluation;
+Accept a converged CPU RKS/UKS object. Fixed-X metric/core terms, orbitals,
+propagation, overlap and NAC remain on CPU. GPU packages load on evaluation;
 device failures are propagated, never replaced by a CPU Fock.
 """
 
@@ -77,3 +77,22 @@ class GPU4PySCFProvider(PySCFProvider):
         potential = mean_field.get_veff(dm=cupy.asarray(density.real, order="C"))
         return (self.energy(state, hcore=cupy.asarray(hcore), potential=potential),
                 self.forces(state, fock=hcore + cupy.asnumpy(potential)))
+
+    def forces(self, state, *, fock=None):
+        """Contract GPU Coulomb/XC derivatives, retaining CPU fixed-X Pulay terms."""
+        density = self._density(state.density())
+        import cupy
+        if fock is None:
+            fock = self.fock(density)
+        gradient = self._gpu_mean_field(density.real).nuc_grad_method()
+        if not hasattr(gradient, "energy_ee"):
+            raise NotImplementedError("GPU fixed-X forces require the GPU4PySCF energy_ee gradient API")
+        gradient.grid_response = True
+        # Pure LDA/GGA explicit derivatives depend on Re(P); metric terms retain complex P.
+        two_electron = cupy.asnumpy(gradient.energy_ee(dm=cupy.asarray(density.real, order="C")))
+        if two_electron.shape != self.positions.shape:
+            raise ValueError("Invalid GPU two-electron derivative shape")
+        result = -(two_electron + self._one_electron_gradient(density, fock))
+        if result.shape != self.positions.shape or not np.isfinite(result).all():
+            raise ValueError("Invalid GPU fixed-X force")
+        return result
