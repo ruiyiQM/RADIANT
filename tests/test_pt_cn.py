@@ -309,7 +309,7 @@ class PTCNTests(unittest.TestCase):
         self.assertIsNone(run.execution.providers[0].cache)
         self.assertEqual(run.execution.providers[0].calls, 0)
 
-    def test_unsupported_occupations_pairs_and_fd_fail_before_advancing(self):
+    def test_unsupported_occupations_and_fd_fail_before_advancing(self):
         inverse = np.eye(2, dtype=complex)
         # Restricted 2/1 groups are accepted (test_pt_mixed); virtual columns are not.
         for occ in ([2,0], [1,0], []):
@@ -317,13 +317,6 @@ class PTCNTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 crank_nicolson(state, np.eye(2), lambda d,t: self.fail('Fock must not be called'),
                                0., .1, options=OPTIONS)
-        with self.assertRaises(ValueError):
-            LocalExecution([ToyProvider(), ToyProvider(1)], options=OPTIONS)
-        pair = LocalExecution([ToyProvider(), ToyProvider(1)])
-        with self.assertRaises(ValueError):
-            pair.advance([[.1,0,0]], .1, options=OPTIONS)
-        self.assertEqual(pair.time, 0.)
-        self.assertTrue(all(p.cache is None for p in pair.providers))
         with self.assertRaises(ValueError):
             PaperFD(options=OPTIONS)
 

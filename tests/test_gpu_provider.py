@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from importlib.util import find_spec
+from itertools import product
 import sys
 from types import SimpleNamespace
 import unittest
@@ -13,12 +14,14 @@ from pyscf import dft, gto, scf
 
 from radiant.backends.gpu_pyscf import GPU4PySCFProvider
 from radiant.backends.pyscf import PySCFProvider
+from radiant.backends.pyscf_nac import ZVectorNAC
 from radiant.core.execution import LocalExecution
 from radiant.core.propagation import CNOptions
 from radiant.core.state import OrbitalState
 from radiant.core.transport import lowdin, transport
 from radiant.driver import follow_path
 from radiant.methods.mash import MASH
+from test_pt_mixed import lih_mean_field
 
 
 def mean_field(unrestricted=False, xc="pbe"):
@@ -184,17 +187,20 @@ class GPUProviderHardwareTests(unittest.TestCase):
                         self.assertLess(gpu.states[0].orthogonality_error(gpu.providers[0].overlap), 1e-10)
                         self.assertEqual(gpu.time, cpu.time)
 
-    def test_two_state_cn_dto_and_spin(self):
-        for mf in self.mean_fields:
-            with self.subTest(kind=type(mf).__name__, xc=mf.xc):
+    def test_two_state_dto_and_spin(self):
+        for mf, variant in product((*self.mean_fields, lih_mean_field()),
+                                   ("cn_accelerated", "pt_cn", "pt_im")):
+            with self.subTest(kind=type(mf).__name__, xc=mf.xc, variant=variant):
                 ground = PySCFProvider(mf).initial_state()
                 if isinstance(mf, dft.uks.UKS):
                     excited = OrbitalState((ground.coefficients[0], mf.mo_coeff[1][:, 1:2]),
                                            ground.occupations)
                 else:
-                    excited = OrbitalState((mf.mo_coeff[:, :2],), ([1., 1.],))
+                    nocc = len(ground.occupations[0])
+                    excited = OrbitalState((mf.mo_coeff[:, :nocc + 1],),
+                                           (np.r_[np.full(nocc - 1, 2.), 1., 1.],))
                 runs = [LocalExecution([kind(mf), kind(mf)], [ground, excited], alphas=[5., 5.],
-                                       options=CNOptions(tolerance=1e-10))
+                                       options=CNOptions(variant, tolerance=1e-10))
                         for kind in (PySCFProvider, GPU4PySCFProvider)]
                 methods = [MASH([np.sqrt(.5), 0., -np.sqrt(.5)]) for _ in runs]
                 path = np.repeat(runs[0].positions[None], 3, axis=0)
@@ -208,6 +214,9 @@ class GPUProviderHardwareTests(unittest.TestCase):
                     assert_allclose(left.density(), right.density(), atol=2e-8, rtol=0)
                 assert_allclose(methods[0].spin, methods[1].spin, atol=2e-8, rtol=0)
                 self.assertEqual(methods[0].active_state, methods[1].active_state)
+                assert_allclose(runs[0].observe().forces, runs[1].observe().forces, atol=2e-8, rtol=0)
+                assert_allclose(ZVectorNAC().compute(runs[0]).raw, ZVectorNAC().compute(runs[1]).raw,
+                                atol=2e-8, rtol=0)
 
 
 if __name__ == "__main__":

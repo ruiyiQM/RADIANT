@@ -337,8 +337,6 @@ class GroupedMidpointTests(unittest.TestCase):
             with self.subTest(occupations=occupations), self.assertRaises(ValueError):
                 crank_nicolson(state, np.eye(3), never, 0., .1, options=OPTIONS)
         with self.assertRaises(ValueError):
-            LocalExecution([ToyProvider(), ToyProvider(1)], options=OPTIONS)
-        with self.assertRaises(ValueError):
             PaperFD(options=OPTIONS)
         for history in (0, -1, 2.5, True):
             with self.subTest(history=history), self.assertRaises(ValueError):

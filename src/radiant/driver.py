@@ -42,7 +42,7 @@ HOP_EVENT_DTYPE = np.dtype([
 
 
 class Trajectory:
-    """Single-RT-state Ehrenfest or paper two-state CN+MASH.
+    """Single-RT-state Ehrenfest or two-state CN/PT propagation with MASH.
 
     MASH hops rescale along the static Z-vector NAC unless nac is given.
 

@@ -20,7 +20,6 @@ from radiant.core.execution import LocalExecution
 from radiant.core.propagation import CNOptions, crank_nicolson
 from radiant.core.state import OrbitalState
 from radiant.core.transport import lowdin, transport
-from toy_provider import ToyProvider
 
 
 OPTIONS = CNOptions('pt_cn', 1e-12, 120)
@@ -204,9 +203,6 @@ class MixedOccupationPTTests(unittest.TestCase):
             with self.subTest(occupations=occupations):
                 assert_allclose(final.density(), state.density(), atol=1e-13, rtol=0)
                 self.assertEqual(diagnostic.iterations, 1)
-        # Two-state PT remains unsupported even when one branch is restricted 2/1.
-        with self.assertRaises(ValueError):
-            LocalExecution([ToyProvider(), ToyProvider(1)], options=OPTIONS)
 
 
 def lih_mean_field():

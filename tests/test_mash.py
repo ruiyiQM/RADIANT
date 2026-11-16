@@ -23,6 +23,7 @@
 """Paper overlap, public spin, signed FD and hop/failure regressions."""
 
 from copy import deepcopy
+from itertools import product
 import json
 from pathlib import Path
 import tempfile
@@ -37,6 +38,7 @@ from scipy.linalg import expm, logm
 from radiant.core.coupling import NACResult, PaperFD, ZeroNACError
 from radiant.core.execution import LocalExecution
 from radiant.core.overlap import GaugeFailure, dto_pair, overlap_coupling, pair_overlap
+from radiant.core.propagation import CNOptions
 from radiant.core.state import NuclearState, OrbitalState
 from radiant.driver import Trajectory
 from radiant.methods.mash import MASH, coefficients_to_spin, legacy_to_public_spin, spin_to_coefficients
@@ -252,19 +254,21 @@ class SpinTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
-    def hopping_run(self, initial=1, momentum=0.):
+    def hopping_run(self, initial=1, momentum=0., variant="cn_accelerated"):
         method=MASH([.6,0.,.8 if initial else -.8])
         def propagate(*args):
             method.coefficients=spin_to_coefficients([.6,0.,-.8 if initial else .8])
         method.propagate=propagate
         nac=type("Axis",(),{"compute":lambda self,run:NACResult(np.array([[1.,0,0]],complex),np.array([[1.,0,0]]),1.)})()
-        run=Trajectory(LocalExecution([ToyProvider(0,force=.1),ToyProvider(1,force=.2)]),
+        run=Trajectory(LocalExecution([ToyProvider(0,force=.1),ToyProvider(1,force=.2)],
+                                     options=CNOptions(variant)),
                        NuclearState([[0,0,0]],[[momentum,0,0]],[2.]),method=method,nac=nac)
         return run
 
     def test_hop_events_active_forces_and_second_half_kick_order(self):
-        for initial,p,outcome in ((1,0.,"accepted"),(0,2.,"accepted"),(0,0.,"frustrated")):
-            run=self.hopping_run(initial,p)
+        for variant, (initial,p,outcome) in product(("cn_accelerated", "pt_cn", "pt_im"),
+                                                   ((1,0.,"accepted"),(0,2.,"accepted"),(0,0.,"frustrated"))):
+            run=self.hopping_run(initial,p,variant)
             frame=run.step(.4)
             event=run.hop_events[0]
             self.assertEqual(event[:5],(1,.4,initial,1-initial,outcome))
@@ -275,8 +279,8 @@ class DriverTests(unittest.TestCase):
             self.assertAlmostEqual(frame["positions"][0,0],(p+.2*force)*.4/2)
 
     def test_zero_nac_saves_failure_and_rolls_back_spin_nuclei_and_electrons(self):
-        for accepted in (0,1):
-            run=self.hopping_run()
+        for variant, accepted in product(("cn_accelerated", "pt_cn", "pt_im"), (0,1)):
+            run=self.hopping_run(variant=variant)
             if accepted:
                 run.method.propagate=lambda *args:None
                 run.step(.4)

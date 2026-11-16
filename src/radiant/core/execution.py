@@ -83,9 +83,8 @@ class LocalExecution:
 
     def _validate_propagation(self, options):
         if options.variant in PT_VARIANTS:
-            if len(self.states) != 1:
-                raise ValueError("PT propagation is validated only for single-state execution")
-            validate_pt_state(self.states[0])
+            for state in self.states:
+                validate_pt_state(state)
 
     def observe(self, *, forces=True):
         energies = np.array([p.energy(s) for p, s in zip(self.providers, self.states)])
