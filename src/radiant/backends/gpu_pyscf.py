@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Ruiyi Zhou
-"""GPU4PySCF Fock, energy and two-electron forces for pure molecular LDA/GGA.
+"""GPU4PySCF Fock/energy and optional two-electron forces for pure LDA/GGA.
 
 Accept a converged CPU RKS/UKS object. Fixed-X metric/core terms, orbitals,
 propagation, overlap and NAC remain on CPU. GPU packages load on evaluation;
@@ -15,13 +15,17 @@ from .pyscf import PySCFProvider
 class GPU4PySCFProvider(PySCFProvider):
     """Pure LDA/GGA provider; construct a new provider to change model settings."""
 
-    def __init__(self, mean_field, *, density_convention="complex"):
+    def __init__(self, mean_field, *, density_convention="complex", gpu_forces=False):
+        if type(gpu_forces) is not bool:
+            raise ValueError("gpu_forces must be a bool")
         super().__init__(mean_field, density_convention=density_convention)
         if (not isinstance(self.mf, dft.rks.KohnShamDFT)
                 or self.mf._numint._xc_type(self.mf.xc) not in ("LDA", "GGA")
                 or any(self.mf._numint.rsh_and_hybrid_coeff(self.mf.xc, spin=self.mf.mol.spin))):
             raise ValueError("GPU Focks require pure LDA/GGA RKS or UKS")
         self._gpu_mf = None
+        # Small-system grid-response GPU setup costs more than the CPU derivative.
+        self.gpu_forces = gpu_forces
 
     def __deepcopy__(self, memo):
         # Device caches are disposable; snapshots must not clone device buffers or contexts.
@@ -80,6 +84,8 @@ class GPU4PySCFProvider(PySCFProvider):
 
     def forces(self, state, *, fock=None):
         """Contract GPU Coulomb/XC derivatives, retaining CPU fixed-X Pulay terms."""
+        if not self.gpu_forces:
+            return super().forces(state, fock=fock)
         density = self._density(state.density())
         import cupy
         if fock is None:

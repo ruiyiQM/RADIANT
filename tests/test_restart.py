@@ -23,8 +23,8 @@ from radiant.restart import load_checkpoint, save_checkpoint
 from test_gpu_provider import mean_field
 
 
-def make_run(mf, variant="pt_im", pair=True, backend=PySCFProvider):
-    provider = backend(mf)
+def make_run(mf, variant="pt_im", pair=True, backend=PySCFProvider, gpu_forces=False):
+    provider = backend(mf, gpu_forces=gpu_forces) if backend is GPU4PySCFProvider else backend(mf)
     states = [provider.initial_state()]
     if pair:
         excited = (OrbitalState((mf.mo_coeff[0][:, :2], mf.mo_coeff[1][:, 1:2]), states[0].occupations)
@@ -121,6 +121,10 @@ class RestartTests(unittest.TestCase):
             values['metadata'] = np.array(json.dumps(info)); np.savez(path, **values)
             with self.assertRaises(ValueError):
                 load_checkpoint(path, templates)
+            values = original.copy(); info = json.loads(str(values['metadata'].item())); info['gpu_forces'] = [True, True]
+            values['metadata'] = np.array(json.dumps(info)); np.savez(path, **values)
+            with self.assertRaisesRegex(ValueError, 'CPU provider'):
+                load_checkpoint(path, templates)
             np.savez(path, **original)
             changed = deepcopy(templates); changed[0].mf.xc = 'lda,vwn'
             with self.assertRaisesRegex(ValueError, 'settings'):
@@ -178,17 +182,19 @@ class RestartTests(unittest.TestCase):
 @unittest.skipUnless(find_spec("cupy") and find_spec("gpu4pyscf"), "Requires a real GPU environment")
 class GPUCheckpointTests(unittest.TestCase):
     def test_gpu_pair_restart_matches_uninterrupted_without_serializing_device_objects(self):
-        for mf in (mean_field(False), mean_field(True)):
-            with self.subTest(kind=type(mf).__name__), tempfile.TemporaryDirectory() as folder:
+        from itertools import product
+        for mf, mode in product((mean_field(False), mean_field(True)), (False, True)):
+            with self.subTest(kind=type(mf).__name__, gpu_forces=mode), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder)/"restart.npz"
-                full = make_run(mf, backend=GPU4PySCFProvider)
-                split = make_run(mf, backend=GPU4PySCFProvider)
+                full = make_run(mf, backend=GPU4PySCFProvider, gpu_forces=mode)
+                split = make_run(mf, backend=GPU4PySCFProvider, gpu_forces=mode)
                 full.run(4, .02)
                 split.run(2, .02, checkpoint=path)
                 with np.load(path, allow_pickle=False) as arrays:
                     self.assertFalse(any(arrays[k].dtype.hasobject for k in arrays.files))
-                templates = [GPU4PySCFProvider(mf), GPU4PySCFProvider(mf)]
+                templates = [GPU4PySCFProvider(mf, gpu_forces=not mode), GPU4PySCFProvider(mf, gpu_forces=not mode)]
                 resumed = load_checkpoint(path, templates)
+                self.assertTrue(all(p.gpu_forces is mode for p in resumed.execution.providers))
                 self.assertIsNot(resumed.execution.providers[0]._gpu_mf, split.execution.providers[0]._gpu_mf)
                 resumed.run(2, .02, checkpoint=path)
                 assert_allclose(resumed.nuclei.positions, full.nuclei.positions, atol=2e-12, rtol=0)

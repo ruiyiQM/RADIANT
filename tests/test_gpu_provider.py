@@ -75,6 +75,9 @@ class GPUProviderContractTests(unittest.TestCase):
             for candidate in (hybrid, meta, hf, mf.density_fit()):
                 with self.assertRaises(ValueError):
                     GPU4PySCFProvider(candidate)
+            for mode in (None, 1, 'gpu'):
+                with self.assertRaises(ValueError):
+                    GPU4PySCFProvider(mf, gpu_forces=mode)
             provider = GPU4PySCFProvider(mf)
             density = provider.initial_state().density()
             for value, time in ((density, np.nan), (density[:1], 0.),
@@ -140,7 +143,7 @@ class GPUProviderHardwareTests(unittest.TestCase):
 
     def test_gradient_device_failure_rolls_back_without_cpu_fallback(self):
         mf = self.mean_fields[0]
-        execution = LocalExecution([GPU4PySCFProvider(mf)])
+        execution = LocalExecution([GPU4PySCFProvider(mf, gpu_forces=True)])
         execution.observe()
         before = execution.snapshot()
         moved = execution.positions.copy(); moved[0, 0] += .001
@@ -157,7 +160,7 @@ class GPUProviderHardwareTests(unittest.TestCase):
         import cupy
         for mf in self.mean_fields:
             with self.subTest(kind=type(mf).__name__, xc=mf.xc):
-                cpu, gpu = PySCFProvider(mf), GPU4PySCFProvider(mf)
+                cpu, gpu = PySCFProvider(mf), GPU4PySCFProvider(mf, gpu_forces=True)
                 state = complex_state(cpu)
                 self.assertGreater(np.max(abs(state.density().imag)), 1e-3)
                 old_overlap = cpu.overlap

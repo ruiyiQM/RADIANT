@@ -136,6 +136,7 @@ def save_checkpoint(run, path):
             enumerate(run.observation.forces) if i not in force_states)):
         raise ValueError("Checkpoint forces must be finite for available states and NaN otherwise")
     info = {"format": 2, "force_states": force_states, "pyscf": pyscf.__version__, "models": models, "stored": stored,
+            "gpu_forces": [getattr(p, "gpu_forces", None) for p in execution.providers],
             "options": asdict(execution.options), "alphas": execution.alphas,
             "time": execution.time, "initial_time": run.initial_time, "nuclear_dt": run.nuclear_dt,
             "mash": run.method is not None, "nac": _nac_settings(run.nac), "hop_tolerance": run.hop_tolerance,
@@ -168,6 +169,16 @@ def load_checkpoint(path, providers):
             raise ValueError("Checkpoint provider/model settings do not match")
         nuclei = NuclearState(arrays["positions"], arrays["momenta"], arrays["masses"])
         candidates = deepcopy(providers)
+        gpu_forces = info.get("gpu_forces", [False if hasattr(p, "gpu_forces") else None for p in candidates])
+        if not isinstance(gpu_forces, list) or len(gpu_forces) != len(candidates):
+            raise ValueError("Invalid checkpoint GPU force modes")
+        for provider, mode in zip(candidates, gpu_forces):
+            if hasattr(provider, "gpu_forces"):
+                if type(mode) is not bool:
+                    raise ValueError("Invalid checkpoint GPU force mode")
+                provider.gpu_forces = mode
+            elif mode is not None:
+                raise ValueError("CPU provider cannot request GPU forces")
         states, gauge = [], []
         for i, provider in enumerate(candidates):
             provider.prepare_geometry(nuclei.positions)
