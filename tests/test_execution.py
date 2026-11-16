@@ -19,6 +19,30 @@ from toy_provider import ToyProvider
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_force_selection_skips_inactive_state_and_preserves_default(self):
+        from radiant.methods.mash import MASH
+        calls = []
+        original = ToyProvider.forces
+        def counted(provider, state):
+            calls.append(provider.branch)
+            return original(provider, state)
+        with patch.object(ToyProvider, 'forces', counted):
+            execution = LocalExecution([ToyProvider(0, rate=0.), ToyProvider(1, rate=0.)])
+            full = execution.observe()
+            self.assertEqual(calls, [0, 1])
+            self.assertTrue(np.isfinite(full.forces).all())
+            calls.clear()
+            run = Trajectory(execution, NuclearState([[0,0,0]], [[0,0,0]], [2.]), method=MASH([0,0,1]))
+            run.run(2, .2)
+            self.assertEqual(calls, [1, 1, 1])
+            self.assertTrue(np.isnan(run.observation.forces[0]).all())
+            self.assertTrue(np.isfinite(run.observation.forces[1]).all())
+            for invalid in ((0,0), (2,), (True,), ([],), None):
+                with self.subTest(selection=invalid), self.assertRaises(ValueError):
+                    execution.advance([[0,0,0]], .2, forces=invalid)
+            self.assertEqual(execution.time, .4)
+            self.assertEqual(calls, [1, 1, 1])
+
     def test_moving_pyscf_endpoint_and_reusable_snapshots(self):
         provider = PySCFProvider(mean_field("rhf"))
         run = LocalExecution([provider], alphas=[2.])

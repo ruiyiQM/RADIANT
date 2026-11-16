@@ -15,6 +15,19 @@ from .propagation import PT_VARIANTS, CNOptions, crank_nicolson, validate_pt_sta
 from .transport import transport
 
 
+def _force_states(forces, count):
+    if isinstance(forces, (bool, np.bool_)):
+        return tuple(range(count)) if forces else ()
+    try:
+        indices = tuple(forces)
+    except TypeError as error:
+        raise ValueError("Force selection must be a bool or state indices") from error
+    if (any(isinstance(i, (bool, np.bool_)) or not isinstance(i, (int, np.integer))
+            or not 0 <= i < count for i in indices) or len(set(indices)) != len(indices)):
+        raise ValueError("Force selection must contain distinct state indices")
+    return indices
+
+
 @dataclass(frozen=True)
 class Observation:
     time: float
@@ -87,9 +100,19 @@ class LocalExecution:
                 validate_pt_state(state)
 
     def observe(self, *, forces=True):
+        """Return energies and selected forces; unrequested rows are NaN.
+
+        forces=True/False keeps the all/none interface; a tuple selects states.
+        """
+        indices = _force_states(forces, len(self.states))
         energies = np.array([p.energy(s) for p, s in zip(self.providers, self.states)])
-        force = np.array([p.forces(s) for p, s in zip(self.providers, self.states)]) if forces else None
-        if not np.isfinite(energies).all() or (force is not None and not np.isfinite(force).all()):
+        force = np.full((len(self.states), *self.positions.shape), np.nan) if indices else None
+        for i in indices:
+            value = np.asarray(self.providers[i].forces(self.states[i]))
+            if value.shape != self.positions.shape or np.iscomplexobj(value):
+                raise ValueError("Endpoint force must be a real nuclear-coordinate array")
+            force[i] = value
+        if not np.isfinite(energies).all() or (indices and not np.isfinite(force[list(indices)]).all()):
             raise ValueError("Non-finite endpoint observation")
         return Observation(self.time, energies, force)
 
@@ -137,6 +160,7 @@ class LocalExecution:
         if len(scales) != len(self.states) or not np.isfinite(scales).all() or min(scales) <= 0:
             raise ValueError("Each state needs a positive finite alpha")
         propagation = self.options if options is None else options
+        _force_states(forces, len(self.states))
         self._validate_propagation(propagation)
         before = self.snapshot()
         anchor = before if gauge_reference is None else gauge_reference

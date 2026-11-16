@@ -16,7 +16,7 @@ import tempfile
 import numpy as np
 
 from .core.coupling import PaperFD
-from .core.execution import LocalExecution, Observation
+from .core.execution import LocalExecution, Observation, _force_states
 from .core.propagation import CNOptions
 from .core.state import NuclearState, OrbitalState
 from .driver import HOP_EVENT_DTYPE, Trajectory
@@ -131,7 +131,11 @@ def save_checkpoint(run, path):
                 arrays[f"grid{i}_{key}"] = value
                 names.append(f"grid_{key}")
         stored.append(names)
-    info = {"format": 1, "pyscf": pyscf.__version__, "models": models, "stored": stored,
+    force_states = tuple(np.flatnonzero(np.isfinite(run.observation.forces).all(axis=(1, 2))))
+    if (run.active_state not in force_states or any(not np.isnan(row).all() for i, row in
+            enumerate(run.observation.forces) if i not in force_states)):
+        raise ValueError("Checkpoint forces must be finite for available states and NaN otherwise")
+    info = {"format": 2, "force_states": force_states, "pyscf": pyscf.__version__, "models": models, "stored": stored,
             "options": asdict(execution.options), "alphas": execution.alphas,
             "time": execution.time, "initial_time": run.initial_time, "nuclear_dt": run.nuclear_dt,
             "mash": run.method is not None, "nac": _nac_settings(run.nac), "hop_tolerance": run.hop_tolerance,
@@ -158,7 +162,7 @@ def load_checkpoint(path, providers):
     providers = tuple(providers)
     with np.load(path, allow_pickle=False) as arrays:
         info = json.loads(str(arrays["metadata"].item()))
-        if info["format"] != 1 or info["pyscf"] != pyscf.__version__:
+        if info["format"] not in (1, 2) or info["pyscf"] != pyscf.__version__:
             raise ValueError("Checkpoint format or PySCF version does not match")
         if [_model(p) for p in providers] != info["models"]:
             raise ValueError("Checkpoint provider/model settings do not match")
@@ -220,9 +224,16 @@ def load_checkpoint(path, providers):
                 raise ValueError("Unknown checkpoint NAC implementation")
         run = Trajectory(execution, nuclei, method=method, nac=nac, hop_tolerance=info["hop_tolerance"])
         energies, forces = arrays["energies"], arrays["forces"]
+        selected = _force_states(info["force_states"] if info["format"] == 2 else True, len(providers))
+        if (run.active_state not in selected or forces.shape != run.observation.forces.shape or
+                not np.isfinite(forces[list(selected)]).all() or any(not np.isnan(row).all()
+                for i, row in enumerate(forces) if i not in selected)):
+            raise ValueError("Invalid checkpoint force availability")
+        if not np.isfinite(run.observation.forces[list(selected)]).all():
+            run.observation = execution.observe(forces=selected)
         if (energies.shape != run.observation.energies.shape or forces.shape != run.observation.forces.shape or
                 not np.allclose(energies, run.observation.energies, atol=1e-8, rtol=0) or
-                not np.allclose(forces, run.observation.forces, atol=1e-8, rtol=0)):
+                not np.allclose(forces, run.observation.forces, atol=1e-8, rtol=0, equal_nan=True)):
             raise ValueError("Checkpoint observations do not match the electronic state")
         run.observation = Observation(execution.time, energies.copy(), forces.copy())
         count = info["frames"]

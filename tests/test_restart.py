@@ -107,7 +107,7 @@ class RestartTests(unittest.TestCase):
             positions = [p.positions.copy() for p in templates]
             for key in ("state0_c0", "gauge1_c0", "positions", "forces", "frame_time"):
                 values = {k: v.copy() for k, v in original.items()}
-                values[key].flat[0] = np.nan
+                values[key].flat[-1 if key == 'forces' else 0] = np.nan
                 np.savez(path, **values)
                 with self.subTest(field=key), self.assertRaises(ValueError):
                     load_checkpoint(path, templates)
@@ -117,7 +117,7 @@ class RestartTests(unittest.TestCase):
                 np.savez(path, **values)
                 with self.subTest(inconsistent_history=key), self.assertRaisesRegex(ValueError, 'accepted state'):
                     load_checkpoint(path, templates)
-            values = original.copy(); info = json.loads(str(values['metadata'].item())); info['format'] = 2
+            values = original.copy(); info = json.loads(str(values['metadata'].item())); info['format'] = 999
             values['metadata'] = np.array(json.dumps(info)); np.savez(path, **values)
             with self.assertRaises(ValueError):
                 load_checkpoint(path, templates)
@@ -127,6 +127,28 @@ class RestartTests(unittest.TestCase):
                 load_checkpoint(path, changed)
             for provider, saved in zip(templates, positions):
                 assert_allclose(provider.positions, saved, atol=0, rtol=0)
+
+    def test_legacy_full_force_checkpoint_and_partial_force_availability(self):
+        run = make_run(self.fields[0]); run.run(1, .02)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'state.npz'
+            save_checkpoint(run, path)
+            with np.load(path, allow_pickle=False) as source:
+                values = {k:source[k] for k in source.files}
+            info = json.loads(str(values['metadata'].item()))
+            self.assertEqual(info['format'], 2)
+            self.assertEqual(info['force_states'], [run.active_state])
+            bad = values.copy(); bad_info = info.copy(); bad_info['force_states'] = [1-run.active_state]
+            bad['metadata'] = np.array(json.dumps(bad_info)); np.savez(path, **bad)
+            with self.assertRaisesRegex(ValueError, 'availability'):
+                load_checkpoint(path, run.execution.providers)
+            info['format'] = 1; info.pop('force_states')
+            values['metadata'] = np.array(json.dumps(info))
+            values['forces'] = run.execution.observe().forces
+            np.savez(path, **values)
+            restored = load_checkpoint(path, run.execution.providers)
+            self.compare(run, restored)
+            self.assertTrue(np.isfinite(restored.observation.forces).all())
 
     def test_failed_atomic_replace_preserves_previous_checkpoint(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -71,7 +71,7 @@ class Trajectory:
         self.nac = nac
         if not np.allclose(execution.positions, nuclei.positions, atol=1e-12, rtol=0):
             raise ValueError("Electronic and nuclear geometries differ")
-        self.observation = execution.observe(forces=True)
+        self.observation = execution.observe(forces=(self.active_state,))
         if len(self.observation.energies) != (1 if method is None else 2):
             raise ValueError("Method/state count mismatch")
         self.time = self.observation.time
@@ -130,6 +130,8 @@ class Trajectory:
                         observation = result.observation
                         if self.method.active_state != selected:
                             raise RuntimeError("A second hop within one step; reduce dt")
+            if not np.isfinite(observation.forces[self.active_state]).all():
+                observation = self.execution.observe(forces=(self.active_state,))
             if not np.isfinite(momentum).all():
                 raise ValueError("Non-finite nuclear momentum")
             self.nuclei.positions, self.nuclei.momenta = end, momentum
@@ -168,11 +170,13 @@ class Trajectory:
 
     def _segment(self, start, momentum, observation, active, dt, end_time, n_substeps):
         """Velocity Verlet on surface `active`, electrons to end_time, then the MASH spin."""
+        if not np.isfinite(observation.forces[active]).all():
+            observation = self.execution.observe(forces=(active,))
         half_momentum = momentum + .5 * dt * observation.forces[active]
         velocity = half_momentum / self.nuclei.masses[:, None]
         end = start + dt * velocity
         result = self.execution.advance(end, end_time - self.execution.time, midpoint=start + .5 * dt * velocity,
-                                        n_substeps=n_substeps, forces=True)
+                                        n_substeps=n_substeps, forces=(active,))
         momentum = half_momentum + .5 * dt * result.observation.forces[active]
         if self.method is not None:
             self.method.propagate(observation.energies, result.observation.energies, result.overlap_raw, dt)

@@ -254,6 +254,34 @@ class SpinTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
+    def test_accepted_hop_completes_new_force_and_force_failure_rolls_back(self):
+        original = ToyProvider.forces
+        calls = []
+        def counted(provider, state):
+            calls.append(provider.branch)
+            return original(provider, state)
+        with patch.object(ToyProvider, 'forces', counted):
+            run = self.hopping_run()
+            run.step(.4)
+            self.assertEqual(calls, [1, 1, 0])
+            self.assertEqual(run.active_state, 0)
+            assert_allclose(run.observation.forces[0], [[.1,0,0]])
+        run = self.hopping_run()
+        before = deepcopy(run.nuclei)
+        spin = run.method.spin.copy()
+        def failed(provider, state):
+            if provider.branch == 0:
+                raise RuntimeError('New active force failed')
+            return original(provider, state)
+        with patch.object(ToyProvider, 'forces', failed), self.assertRaisesRegex(RuntimeError, 'active force'):
+            run.step(.4)
+        self.assertEqual(run.time, 0.)
+        self.assertEqual(run.active_state, 1)
+        self.assertEqual(len(run.frames), 0)
+        self.assertEqual(run.hop_events[-1][4], 'failed')
+        assert_allclose(run.nuclei.positions, before.positions, atol=0, rtol=0)
+        assert_allclose(run.method.spin, spin, atol=0, rtol=0)
+
     def hopping_run(self, initial=1, momentum=0., variant="cn_accelerated"):
         method=MASH([.6,0.,.8 if initial else -.8])
         def propagate(*args):
@@ -338,6 +366,8 @@ class TullyExecution:
 
     def observe(self, *, forces=True):
         energies, force, _ = self.adiabatic(self.x)
+        if not isinstance(forces, bool):
+            force[[i for i in range(2) if i not in forces]] = np.nan
         return SimpleNamespace(time=self.time, energies=energies, forces=force)
 
     def snapshot(self):
@@ -349,11 +379,26 @@ class TullyExecution:
     def advance(self, end, dt, *, midpoint=None, n_substeps=1, forces=True):
         old = self.adiabatic(self.x)[2]
         self.x, self.time = float(end[0][0]), self.time + dt
-        return SimpleNamespace(observation=self.observe(), overlap_raw=old.T @ self.adiabatic(self.x)[2])
+        return SimpleNamespace(observation=self.observe(forces=forces), overlap_raw=old.T @ self.adiabatic(self.x)[2])
 
 
 class ReversibleHopTests(unittest.TestCase):
     axis = SimpleNamespace(compute=lambda execution: SimpleNamespace(raw=np.array([[1., 0, 0]])))
+
+    def test_selected_forces_match_all_forces_through_localized_hops(self):
+        class Eager(TullyExecution):
+            def observe(self, *, forces=True):
+                return super().observe(forces=True)
+        for p,spin,steps in ((16.16,(.6,.2,-.77),20),(6.,(.3,.95,-.1),30)):
+            spin=np.asarray(spin)/np.linalg.norm(spin)
+            runs=[Trajectory(kind(-1.5), NuclearState([[-1.5,0,0]],[[p,0,0]],[2000.]),
+                             method=MASH(spin),nac=self.axis,hop_tolerance=1e-8)
+                  for kind in (TullyExecution,Eager)]
+            for run in runs:run.run(steps,20.)
+            self.assertTrue(runs[0].hop_events)
+            self.assertEqual(runs[0].hop_events,runs[1].hop_events)
+            for a,b in zip(runs[0].frames,runs[1].frames):
+                for key in a:assert_allclose(a[key],b[key],atol=0,rtol=0)
 
     def tully(self, dt, steps, tolerance, x=-1.5, p=16.16, spin=(.6, .2, -.77)):
         spin = np.asarray(spin)/np.linalg.norm(spin)
