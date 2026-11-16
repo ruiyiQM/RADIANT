@@ -167,6 +167,39 @@ class ZVectorNACTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ZVectorNAC(tolerance=0.)
 
+    def test_pure_imaginary_nac_keeps_the_same_mash_hop(self):
+        from radiant.methods.mash import MASH
+        original = ZVectorNAC().compute(self.execution(self.states))
+        ground, excited = self.states
+        coefficients = ground.coefficients[0].copy()
+        coefficients[:, 0] *= np.exp(.25j * np.pi)
+        phased = OrbitalState((coefficients,), ground.occupations)
+        assert_allclose(phased.density(), ground.density(), atol=1e-14, rtol=0)
+        result = ZVectorNAC().compute(self.execution((phased, excited)))
+        assert_allclose(result.raw, -1j * original.raw, atol=1e-10, rtol=0)
+        self.assertAlmostEqual(result.real_norm, original.real_norm, places=10)
+        momentum = np.full_like(original.raw.real, 2.)
+        masses = np.arange(1., len(momentum) + 1)
+        hops = [MASH([.6, 0., .8]).resolve_hop(momentum, raw, [0., .3], masses, initial_state=0)
+                for raw in (original.raw, result.raw)]
+        self.assertEqual(hops[0][1], hops[1][1])
+        assert_allclose(hops[0][0], hops[1][0], atol=1e-12, rtol=0)
+
+    def test_result_uses_the_largest_real_component_over_phases(self):
+        from radiant.core.coupling import ZeroNACError
+        raw = np.array([[1., .2, 0.], [0., .5, -.3]]) + 1j * np.array([[.3, -.4, .1], [.6, 0., .2]])
+        norm = np.linalg.svd([raw.real.ravel(), raw.imag.ravel()], compute_uv=False)[0]
+        reference = ZVectorNAC._result(raw).real_direction.ravel()
+        for phase in (0., .5, np.pi / 2, np.pi):
+            value = np.exp(1j * phase) * raw
+            result = ZVectorNAC._result(value)
+            assert_allclose(result.raw, value, atol=0, rtol=0)
+            self.assertAlmostEqual(result.real_norm, norm, places=12)
+            self.assertAlmostEqual(abs(np.dot(result.real_direction.ravel(), reference)), 1., places=12)
+        for value in (np.zeros((1, 3)), np.full((1, 3), np.nan), np.full((1, 3), np.inf)):
+            with self.assertRaises(ZeroNACError):
+                ZVectorNAC._result(value)
+
 
 if __name__ == "__main__":
     unittest.main()

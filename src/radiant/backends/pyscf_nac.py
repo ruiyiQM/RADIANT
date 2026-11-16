@@ -211,10 +211,16 @@ class ZVectorNAC:
 
     @staticmethod
     def _result(raw):
-        norm = float(np.linalg.norm(raw.real))
+        """Keep raw phases; report the real component maximized over state phases."""
+        if not np.isfinite(raw).all():
+            raise ZeroNACError("The Z-vector NAC is non-finite")
+        phase = .5 * np.arctan2(2 * np.sum(raw.real * raw.imag),
+                               np.sum(raw.real**2 - raw.imag**2))
+        direction = (np.exp(-1j * phase) * raw).real
+        norm = float(np.linalg.norm(direction))
         if not np.isfinite(norm) or norm <= 64 * np.finfo(float).eps:
-            raise ZeroNACError("The Z-vector NAC has no real part; its direction is undefined")
-        return NACResult(raw, raw.real / norm, norm)
+            raise ZeroNACError("The Z-vector NAC is zero; its direction is undefined")
+        return NACResult(raw, direction / norm, norm)
 
     def _unrestricted(self, execution):
         occupied = [tuple(c[:, f == 1] for c, f in zip(s.coefficients, s.occupations)) for s in execution.gauge]
