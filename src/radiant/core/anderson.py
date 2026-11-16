@@ -23,6 +23,7 @@
 """Anderson mixing from TDMASH v0.1.0, Anderson.py."""
 
 import numpy as np
+from .arrays import array_module
 class AndersonAcceleration:
     def __init__(self, history_size=5, regularization=1e-4):
         self.history_size = history_size
@@ -39,6 +40,7 @@ class AndersonAcceleration:
         x_out: The output parameters (e.g., F_calculated)
         Returns: Optimized guess for next iteration.
         """
+        xp = array_module(x_in)
         # Flatten matrices to vectors for linear algebra
         flat_in = x_in.ravel()
         flat_out = x_out.ravel()
@@ -56,12 +58,12 @@ class AndersonAcceleration:
             return x_out # Not enough history, return direct update
 
         # Matrix of residuals: F_k = [f_k, f_{k-1}, ...]
-        F = np.column_stack(self.f_history)
+        F = xp.column_stack(self.f_history)
         # Matrix of differences: dF_i = f_i - f_{i-1}
-        dF = np.diff(F, axis=1)
+        dF = xp.diff(F, axis=1)
         # Matrix of input differences: dX_i = x_i - x_{i-1}
-        dX = np.column_stack(self.x_history)
-        dX = np.diff(dX, axis=1)
+        dX = xp.column_stack(self.x_history)
+        dX = xp.diff(dX, axis=1)
 
         # Solve least squares for mixing coefficients
         # We want to minimize || f(x) || approx || f_k + dF * gamma ||
@@ -75,15 +77,15 @@ class AndersonAcceleration:
         # Solving linear system: dF.T @ dF @ theta = dF.T @ latest_res
         # Add regularization for stability
         ATA = dF.conj().T @ dF
-        ATA += self.regularization * np.eye(ATA.shape[0])
+        ATA += self.regularization * xp.eye(ATA.shape[0])
         ATb = dF.conj().T @ latest_res
 
         try:
-            theta = np.linalg.solve(ATA, ATb)
+            theta = xp.linalg.solve(ATA, ATb)
         except np.linalg.LinAlgError:
             return x_out # Fallback if singular
 
         # Compute accelerated point
-        x_acc = flat_in - np.dot(dX, theta) + (latest_res - np.dot(dF, theta))
+        x_acc = flat_in - xp.dot(dX, theta) + (latest_res - xp.dot(dF, theta))
 
         return x_acc.reshape(x_in.shape)

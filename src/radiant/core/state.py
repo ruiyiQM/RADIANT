@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .arrays import array_module, max_abs
+
 
 @dataclass
 class OrbitalState:
@@ -18,7 +20,8 @@ class OrbitalState:
     occupations: tuple
 
     def __post_init__(self):
-        self.coefficients = tuple(np.array(c, dtype=complex, copy=True)
+        xp = array_module(self.coefficients[0]) if self.coefficients else np
+        self.coefficients = tuple(xp.array(c, dtype=complex, copy=True)
                                   for c in self.coefficients)
         self.occupations = tuple(np.array(f, dtype=float, copy=True)
                                 for f in self.occupations)
@@ -30,21 +33,45 @@ class OrbitalState:
         for c, f in zip(self.coefficients, self.occupations):
             if c.ndim != 2 or f.ndim != 1 or c.shape != (nao, f.size):
                 raise ValueError("Orbital/occupation dimensions do not match")
-            if not np.isfinite(c).all() or not np.isfinite(f).all():
+            if not xp.isfinite(c).all() or not np.isfinite(f).all():
                 raise ValueError("Orbitals and occupations must be finite")
             if not np.isin(f, (0, 1, 2) if len(self.coefficients) == 1 else (0, 1)).all():
                 raise ValueError("Fractional occupations are not supported")
+        self._weights = tuple(xp.asarray(f) for f in self.occupations)
+        if xp is not np:
+            for f in self.occupations:
+                f.flags.writeable = False
 
     def density(self):
+        xp = array_module(self.coefficients[0])
         blocks = tuple((c * f) @ c.conj().T
-                       for c, f in zip(self.coefficients, self.occupations))
-        return blocks[0] if len(blocks) == 1 else np.array(blocks)
+                       for c, f in zip(self.coefficients, self._weights))
+        return blocks[0] if len(blocks) == 1 else xp.stack(blocks)
 
     def copy(self):
-        return OrbitalState(self.coefficients, self.occupations)
+        return self.with_coefficients(self.coefficients)
+
+    def __deepcopy__(self, memo):
+        result = self.copy()
+        memo[id(self)] = result
+        return result
+
+    def with_coefficients(self, coefficients):
+        xp = array_module(self.coefficients[0])
+        if xp is np:
+            return OrbitalState(coefficients, self.occupations)
+        result = object.__new__(OrbitalState)
+        result.coefficients = tuple(xp.array(c, dtype=complex, copy=True) for c in coefficients)
+        if len(result.coefficients) != len(self.coefficients) or any(
+                c.shape != old.shape or not xp.isfinite(c).all()
+                for c, old in zip(result.coefficients, self.coefficients)):
+            raise ValueError("Replacement orbitals must retain finite block dimensions")
+        result.occupations, result._weights = self.occupations, self._weights
+        return result
 
     def orthogonality_error(self, overlap):
-        return max((float(np.max(np.abs(c.conj().T @ overlap @ c - np.eye(c.shape[1])), initial=0))
+        xp = array_module(self.coefficients[0])
+        return max((max_abs(c.conj().T @ overlap @ c - xp.eye(c.shape[1]))
                     for c in self.coefficients), default=0.)
 
 

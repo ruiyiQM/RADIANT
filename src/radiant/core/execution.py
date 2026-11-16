@@ -13,6 +13,8 @@ import numpy as np
 
 from .propagation import PT_VARIANTS, CNOptions, crank_nicolson, validate_pt_state
 from .transport import transport
+from .state import OrbitalState
+from .arrays import array_module, to_host
 
 
 def _force_states(forces, count):
@@ -62,7 +64,13 @@ class LocalExecution:
         self.providers = tuple(providers)
         if len(self.providers) not in (1, 2):
             raise ValueError("Only one-state RT or a two-state DTO pair is supported")
-        self.states = tuple(p.initial_state() for p in self.providers) if states is None else tuple(s.copy() for s in states)
+        if states is not None:
+            states = tuple(states)
+            if len(states) != len(self.providers):
+                raise ValueError("Provider/state counts do not match")
+        self.states = (tuple(p.initial_state() for p in self.providers) if states is None else
+                       tuple(OrbitalState(tuple(getattr(p, "array_module", np).asarray(c) for c in s.coefficients),
+                                          s.occupations) for p, s in zip(self.providers, states)))
         if len(self.states) != len(self.providers):
             raise ValueError("Provider/state counts do not match")
         self.alphas = tuple(1. for _ in self.states) if alphas is None else tuple(alphas)
@@ -73,6 +81,9 @@ class LocalExecution:
         self.time = float(time)
         self._identity = object()
         self.gauge = None
+        xp = array_module(self.states[0].coefficients[0])
+        if any(array_module(s.coefficients[0]) is not xp for s in self.states):
+            raise ValueError("Electronic states must use the same array backend")
         if not np.isfinite(self.time):
             raise ValueError("Initial time must be finite")
         for provider, state in zip(self.providers, self.states):
@@ -83,8 +94,8 @@ class LocalExecution:
             cross = provider.cross_overlap(self.providers[0].mf.mol, provider.mf.mol)
             common = self.providers[0].overlap
             if (provider.overlap.shape != common.shape or cross.shape != common.shape
-                    or not np.allclose(provider.overlap, common, atol=1e-12, rtol=0)
-                    or not np.allclose(cross, common, atol=1e-12, rtol=0)):
+                    or not xp.allclose(provider.overlap, common, atol=1e-12, rtol=0)
+                    or not xp.allclose(cross, common, atol=1e-12, rtol=0)):
                 raise ValueError("States must share the same ordered AO basis")
         if len(self.states) == 2:
             from .overlap import dto_pair
@@ -146,7 +157,7 @@ class LocalExecution:
             raise ValueError("DTO overlap requires a two-state pair")
         from .overlap import pair_overlap
         cross = self.providers[0].cross_overlap(left.providers[0].mf.mol, right.providers[0].mf.mol)
-        return pair_overlap(left.gauge, right.gauge, cross)
+        return to_host(pair_overlap(left.gauge, right.gauge, cross))
 
     def advance(self, end, dt, *, midpoint=None, n_substeps=1, alphas=None,
                 options=None, gauge_reference=None, forces=True):
@@ -196,7 +207,7 @@ class LocalExecution:
                     reference=anchor.gauge, cross=cross, align_all=gauge_reference is not None)
                 raw = self.overlap(before, self.snapshot())
                 unitary, singular, _ = overlap_coupling(raw, dt)
-                gram = pair_overlap(self.gauge, self.gauge, self.providers[0].overlap)
+                gram = to_host(pair_overlap(self.gauge, self.gauge, self.providers[0].overlap))
             return StepResult(before.time, self.observe(forces=forces), tuple(diagnostics),
                               raw, unitary, singular, gram)
         except BaseException:

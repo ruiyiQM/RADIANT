@@ -45,8 +45,8 @@ An unrestricted pair is two single determinants, each a stationary point of the 
 both are relaxed and there is no DTO rotation:
   d = (<0|d1> - conj<1|d0>)/2,  <Y|dX> = sum_s [Tr(<mu|d nu> t^s_YX) + sum_pi U^s_pi W^s_pi],
 with u_oo = -S1_oo/2 and the virtual rows from the per-spin CPKS of state X. Each state needs two
-Z-vectors (real and imaginary part); MINRES is used because an excited state's Hessian is
-indefinite. For a non-orthogonal pair the Loewdin-consistent coupling has the same direction and a
+Z-vectors (real and imaginary part); CPU MINRES or device Krylov handles an excited state's
+indefinite Hessian. For a non-orthogonal pair the Loewdin-consistent coupling has the same direction and a
 norm larger by 1/sqrt(1 - |<0|1>|^2).
 """
 
@@ -54,9 +54,9 @@ from copy import deepcopy
 
 import numpy as np
 from pyscf import dft
-from scipy.linalg import null_space
 from scipy.sparse.linalg import LinearOperator, minres
 
+from ..core.arrays import array_module, null_space, to_host, max_abs
 from ..core.coupling import NACResult, ZeroNACError
 from ..core.overlap import _determinants
 from ..core.state import OrbitalState
@@ -64,19 +64,23 @@ from ..core.transport import lowdin
 
 
 def _adjugate(m):
-    u, s, vh = np.linalg.svd(m)
-    cofactors = np.array([np.prod(np.delete(s, j)) for j in range(len(s))])
-    return np.linalg.det(u) * np.linalg.det(vh) * (vh.conj().T * cofactors) @ u.conj().T
+    xp = array_module(m)
+    if not m.size:
+        return m.copy()
+    u, s, vh = xp.linalg.svd(m)
+    cofactors = xp.stack([xp.prod(xp.delete(s, j)) for j in range(len(s))])
+    return xp.linalg.det(u) * xp.linalg.det(vh) * (vh.conj().T * cofactors) @ u.conj().T
 
 
 def _spin_transition_densities(left, right, overlap):
     """AO matrices (t_alpha, t_beta) with <left| sum_i o_s(i) |right> = Tr(O t_s)."""
+    xp = array_module(overlap)
     ta = tb = 0
     for al, bl, wl in _determinants(left):
         for ar, br, wr in _determinants(right):
             ma, mb = al.conj().T @ overlap @ ar, bl.conj().T @ overlap @ br
-            ta = ta + wl * wr * np.linalg.det(mb) * ar @ _adjugate(ma) @ al.conj().T
-            tb = tb + wl * wr * np.linalg.det(ma) * br @ _adjugate(mb) @ bl.conj().T
+            ta = ta + wl * wr * xp.linalg.det(mb) * ar @ _adjugate(ma) @ al.conj().T
+            tb = tb + wl * wr * xp.linalg.det(ma) * br @ _adjugate(mb) @ bl.conj().T
     return ta, tb
 
 
@@ -88,20 +92,25 @@ def _transition_density(left, right, overlap):
 def _canonical(occupied, overlap, fock):
     """[occupied | complement] diagonalising fock in each block; the occupied rotation has
     determinant 1, so the determinant and its phase are unchanged."""
+    xp = array_module(overlap)
     inverse_half, half = lowdin(overlap)
     x = half @ occupied
-    c = inverse_half @ np.column_stack([x, null_space(x.conj().T)])
+    c = inverse_half @ xp.column_stack([x, null_space(x.conj().T)])
     nocc = occupied.shape[1]
-    e = np.zeros(c.shape[1])
+    e = xp.zeros(c.shape[1])
     for block in (slice(0, nocc), slice(nocc, None)):
-        e[block], v = np.linalg.eigh(c[:, block].conj().T @ fock @ c[:, block])
-        v[:, 0] *= np.conj(np.linalg.det(v))
+        if not c[:, block].shape[1]:
+            continue
+        e[block], v = xp.linalg.eigh(c[:, block].conj().T @ fock @ c[:, block])
+        v[:, 0] *= xp.conj(xp.linalg.det(v))
         c[:, block] = c[:, block] @ v
     return c, e
 
 
-def _derivative_integrals(mol):
+def _derivative_integrals(mol, provider=None):
     """<mu| d nu/dR_A> and dS/dR_A, both (natm, 3, nao, nao)."""
+    if getattr(provider, "device_resident", False):
+        return provider.derivative_integrals()
     ip = mol.intor("int1e_ipovlp", comp=3)                       # <grad mu|nu>
     basis = np.zeros((mol.natm, 3, mol.nao, mol.nao))
     for atom, (_, _, p0, p1) in enumerate(mol.aoslice_by_atom()):
@@ -111,10 +120,11 @@ def _derivative_integrals(mol):
 
 def _transport_generators(overlap, ds):
     """K with dC = K C at fixed S**(1/2) C: K = -S**(-1/2) Y, S**(1/2) Y + Y S**(1/2) = dS."""
-    w, v = np.linalg.eigh(overlap)
-    root = np.sqrt(w)
-    y = np.einsum("pi,axpq,qj->axij", v, ds, v) / (root[:, None] + root[None, :])
-    return -np.einsum("pi,axij,qj->axpq", v / root, y, v)
+    xp = array_module(overlap)
+    w, v = xp.linalg.eigh(overlap)
+    root = xp.sqrt(w)
+    y = xp.einsum("pi,axpq,qj->axij", v, ds, v) / (root[:, None] + root[None, :])
+    return -xp.einsum("pi,axij,qj->axpq", v / root, y, v)
 
 
 def _uses_real_density(provider):
@@ -143,6 +153,7 @@ class ZVectorNAC:
             return self._result(self._unrestricted(execution))
         ground, gauge_excited = execution.states[0], execution.gauge[1]
         mol, overlap = provider.mf.mol, provider.overlap
+        xp = array_module(overlap)
         nocc = ground.coefficients[0].shape[1]
         density = ground.density().real
         inverse_half, half = lowdin(overlap)
@@ -156,25 +167,29 @@ class ZVectorNAC:
         gauge = (OrbitalState((co,), ground.occupations), gauge_excited)
         t01 = _transition_density(gauge[0], gauge[1], overlap)
         t10 = _transition_density(gauge[1], gauge[0], overlap)
-        basis, ds = _derivative_integrals(mol)
+        basis, ds = _derivative_integrals(mol, provider)
         k = _transport_generators(overlap, ds)
-        a_t = np.einsum("axij,ji->ax", basis + overlap @ k, t01)
+        a_t = xp.einsum("axij,ji->ax", basis + overlap @ k, t01)
         w = (co.conj().T @ overlap @ t10 @ overlap @ c).T                      # (nmo, nocc)
         u_t = c.conj().T @ overlap @ k @ co
-        b_t = np.einsum("axij,ji->ax", basis, t10) + np.einsum("axpi,pi->ax", u_t, w)   # <1|d0>, transported
+        b_t = xp.einsum("axij,ji->ax", basis, t10) + xp.einsum("axpi,pi->ax", u_t, w)   # <1|d0>, transported
 
         # response at Re P, through its natural orbitals scaled by sqrt(n/2) with occupation 2
-        n, vectors = np.linalg.eigh(half @ density @ half)
+        n, vectors = xp.linalg.eigh(half @ density @ half)
         keep = n > 1e-10
-        mo, occ = (inverse_half @ vectors[:, keep]) * np.sqrt(n[keep] / 2), np.full(int(keep.sum()), 2.)
-        mf = deepcopy(provider.mf)
-        mf.mo_coeff, mf.mo_occ = mo, occ
+        mo, occ = (inverse_half @ vectors[:, keep]) * xp.sqrt(n[keep] / 2), xp.full(int(keep.sum()), 2.)
+        mf = provider.response_model(mo, occ) if getattr(provider, "device_resident", False) else deepcopy(provider.mf)
+        if getattr(provider, "device_resident", False):
+            mo, occ = mf.mo_coeff, mf.mo_occ
+        else:
+            mf.mo_coeff, mf.mo_occ = mo, occ
         response = mf.gen_response(mo, occ, hermi=1)
         s1 = c.conj().T @ ds @ co
-        f1 = cv.conj().T @ np.asarray(mf.Hessian().make_h1(mo, occ)) @ co
+        h1 = provider.response_h1(mf, mo, occ) if getattr(provider, "device_resident", False) else mf.Hessian().make_h1(mo, occ)
+        f1 = cv.conj().T @ xp.asarray(h1) @ co
 
         def kernel(dm):
-            v = np.asarray(response(dm.reshape(-1, *dm.shape[-2:]))).reshape(dm.shape)
+            v = xp.asarray(response(dm.reshape(-1, *dm.shape[-2:]))).reshape(dm.shape)
             return cv.conj().T @ v @ co
 
         def density_change(rotation, rows):
@@ -191,47 +206,49 @@ class ZVectorNAC:
         excited = gauge[1]
         core, pair = (excited.coefficients[0][:, excited.occupations[0] == f] for f in (2, 1))
         p, y = co.conj().T @ overlap @ pair, cv.conj().T @ overlap @ pair
-        m = np.real(np.sum(p.conj() * p, axis=0))
-        n_hh, n_pp = (np.linalg.det(co.conj().T @ overlap @ np.column_stack([core, pair[:, j]])) ** 2 for j in (0, 1))
-        alpha_e = np.outer(y[:, 1].conj(), p[:, 0]) / (m[0] - m[1])
-        beta_e = np.outer(y[:, 0], p[:, 1].conj()) / (m[0] - m[1])
-        alpha = np.sqrt(.5) * (n_pp * alpha_e - n_hh * beta_e.conj())
-        beta = np.sqrt(.5) * (n_pp * beta_e - n_hh * alpha_e.conj()) - .5 * w[nocc:].conj()
+        m = xp.real(xp.sum(p.conj() * p, axis=0))
+        n_hh, n_pp = (xp.linalg.det(co.conj().T @ overlap @ xp.column_stack([core, pair[:, j]])) ** 2 for j in (0, 1))
+        alpha_e = xp.outer(y[:, 1].conj(), p[:, 0]) / (m[0] - m[1])
+        beta_e = xp.outer(y[:, 0], p[:, 1].conj()) / (m[0] - m[1])
+        alpha = xp.sqrt(.5) * (n_pp * alpha_e - n_hh * beta_e.conj())
+        beta = xp.sqrt(.5) * (n_pp * beta_e - n_hh * alpha_e.conj()) - .5 * w[nocc:].conj()
         # complex FON-like minima have a degenerate occupied/virtual pair (delta = 0) that only the
         # kernel stabilises, so the diagonal preconditioner is floored
-        preconditioner = np.maximum(delta, .05)
+        preconditioner = xp.maximum(delta, .05)
         z_re = self._solve(hessian, preconditioner, alpha.conj() + beta)
         z_im = self._solve(hessian, preconditioner, 1j * (alpha.conj() - beta))
-        relaxed = (np.real(np.einsum("ai,bxai->bx", z_re.conj(), rhs))
-                   + 1j * np.real(np.einsum("ai,bxai->bx", z_im.conj(), rhs)))
+        relaxed = (xp.real(xp.einsum("ai,bxai->bx", z_re.conj(), rhs))
+                   + 1j * xp.real(xp.einsum("ai,bxai->bx", z_im.conj(), rhs)))
         u_tv = u_t[..., nocc:, :]
-        relaxed -= np.einsum("bxai,ai->bx", u_tv, alpha) + np.einsum("bxai,ai->bx", u_tv.conj(), beta)
-        relaxed -= .5 * np.conj(np.einsum("axij,ij->ax", u_occ - u_t[..., :nocc, :], w[:nocc]))
-        return self._result(.5 * (a_t - np.conj(b_t)) + relaxed)
+        relaxed -= xp.einsum("bxai,ai->bx", u_tv, alpha) + xp.einsum("bxai,ai->bx", u_tv.conj(), beta)
+        relaxed -= .5 * xp.conj(xp.einsum("axij,ij->ax", u_occ - u_t[..., :nocc, :], w[:nocc]))
+        return self._result(.5 * (a_t - xp.conj(b_t)) + relaxed)
 
     @staticmethod
     def _result(raw):
         """Keep raw phases; report the real component maximized over state phases."""
-        if not np.isfinite(raw).all():
+        xp = array_module(raw)
+        if not xp.isfinite(raw).all():
             raise ZeroNACError("The Z-vector NAC is non-finite")
-        phase = .5 * np.arctan2(2 * np.sum(raw.real * raw.imag),
-                               np.sum(raw.real**2 - raw.imag**2))
-        direction = (np.exp(-1j * phase) * raw).real
-        norm = float(np.linalg.norm(direction))
+        phase = .5 * xp.arctan2(2 * xp.sum(raw.real * raw.imag),
+                               xp.sum(raw.real**2 - raw.imag**2))
+        direction = (xp.exp(-1j * phase) * raw).real
+        norm = float(xp.linalg.norm(direction))
         if not np.isfinite(norm) or norm <= 64 * np.finfo(float).eps:
             raise ZeroNACError("The Z-vector NAC is zero; its direction is undefined")
-        return NACResult(raw, direction / norm, norm)
+        return NACResult(to_host(raw), to_host(direction / norm), norm)
 
     def _unrestricted(self, execution):
         occupied = [tuple(c[:, f == 1] for c, f in zip(s.coefficients, s.occupations)) for s in execution.gauge]
         g10 = self._relaxed_coupling(execution.providers[0], occupied[0], occupied[1])   # <1|d0>
         g01 = self._relaxed_coupling(execution.providers[1], occupied[1], occupied[0])   # <0|d1>
-        return .5 * (g01 - np.conj(g10))
+        return .5 * (g01 - g10.conj())
 
     def _relaxed_coupling(self, provider, right, left):
         """<left| d right>, natm x 3, with the right determinant relaxed by per-spin CPKS."""
         mol, overlap = provider.mf.mol, provider.overlap
-        density = np.array([c @ c.conj().T for c in right])
+        xp = array_module(overlap)
+        density = xp.stack([c @ c.conj().T for c in right])
         fock = provider.fock(density)
         nocc = [c.shape[1] for c in right]
         cs, es = zip(*(_canonical(right[s], overlap, fock[s]) for s in range(2)))
@@ -239,21 +256,24 @@ class ZVectorNAC:
         cv = [c[:, n:] for c, n in zip(cs, nocc)]
         t = _spin_transition_densities(OrbitalState(left, tuple(np.ones(c.shape[1]) for c in left)),
                                        OrbitalState(co, tuple(np.ones(n) for n in nocc)), overlap)
-        basis, ds = _derivative_integrals(mol)
+        basis, ds = _derivative_integrals(mol, provider)
         w = [(co[s].conj().T @ overlap @ t[s] @ overlap @ cs[s]).T for s in range(2)]   # (nmo, nocc)
 
         # response at Re P^s, through its natural orbitals scaled by sqrt(n) with occupation 1
         inverse_half, half = lowdin(overlap)
         mo, occ = [], []
         for s in range(2):
-            n, vectors = np.linalg.eigh(half @ density[s].real @ half)
+            n, vectors = xp.linalg.eigh(half @ density[s].real @ half)
             keep = n > 1e-10
-            mo.append((inverse_half @ vectors[:, keep]) * np.sqrt(n[keep]))
-            occ.append(np.ones(int(keep.sum())))
-        mf = deepcopy(provider.mf)
-        mf.mo_coeff, mf.mo_occ = mo, occ
+            mo.append((inverse_half @ vectors[:, keep]) * xp.sqrt(n[keep]))
+            occ.append(xp.ones(int(keep.sum())))
+        mf = provider.response_model(mo, occ) if getattr(provider, "device_resident", False) else deepcopy(provider.mf)
+        if getattr(provider, "device_resident", False):
+            mo, occ = mf.mo_coeff, mf.mo_occ
+        else:
+            mf.mo_coeff, mf.mo_occ = mo, occ
         response = mf.gen_response(mo, occ, hermi=1)
-        h1 = mf.Hessian().make_h1(mo, occ)
+        h1 = provider.response_h1(mf, mo, occ) if getattr(provider, "device_resident", False) else mf.Hessian().make_h1(mo, occ)
         delta = [es[s][nocc[s]:, None] - es[s][None, :nocc[s]] for s in range(2)]
         s1 = [cs[s].conj().T @ ds @ co[s] for s in range(2)]
 
@@ -262,23 +282,23 @@ class ZVectorNAC:
             for s in range(2):
                 d = rows[s] @ rotations[s] @ co[s].conj().T
                 dms.append((d + d.conj().swapaxes(-1, -2)).real.reshape(-1, *overlap.shape))
-            v = np.asarray(response(np.array(dms)))
+            v = xp.asarray(response(xp.stack(dms)))
             return [(cv[s].conj().T @ v[s] @ co[s]).reshape(*rotations[s].shape[:-2], *delta[s].shape)
                     for s in range(2)]
 
         u_occ = [-.5 * s1[s][..., :nocc[s], :] for s in range(2)]
         k_occ = kernel(u_occ, co)
-        rhs = [-(cv[s].conj().T @ np.asarray(h1[s]) @ co[s] - s1[s][..., nocc[s]:, :] * es[s][:nocc[s]]) - k_occ[s]
+        rhs = [-(cv[s].conj().T @ xp.asarray(h1[s]) @ co[s] - s1[s][..., nocc[s]:, :] * es[s][:nocc[s]]) - k_occ[s]
                for s in range(2)]
-        coupling = sum(np.einsum("axij,ji->ax", basis, t[s]) + np.einsum("axij,ij->ax", u_occ[s], w[s][:nocc[s]])
+        coupling = sum(xp.einsum("axij,ji->ax", basis, t[s]) + xp.einsum("axij,ij->ax", u_occ[s], w[s][:nocc[s]])
                        for s in range(2))
 
         # the relaxation sum_x U_x W is real-linear in U: one Z-vector each for its real and imaginary part
         sizes = [d.size for d in delta]
 
         def pack(parts):
-            z = np.concatenate([p.ravel() for p in parts])
-            return np.concatenate([z.real, z.imag])
+            z = xp.concatenate([p.ravel() for p in parts])
+            return xp.concatenate([z.real, z.imag])
 
         def unpack(x):
             z = x[:sum(sizes)] + 1j * x[sum(sizes):]
@@ -292,32 +312,39 @@ class ZVectorNAC:
         n = 2 * sum(sizes)
         # complex FON-like minima have a degenerate occupied/virtual pair (delta = 0), so the
         # diagonal preconditioner is floored as in the restricted solver
-        floor = 1 / np.maximum(np.abs(pack(delta)[:n // 2]), .05)
-        preconditioner = LinearOperator((n, n), matvec=lambda x: np.concatenate([floor, floor]) * x, dtype=float)
-        operator = LinearOperator((n, n), matvec=hessian, dtype=float)
+        floor = 1 / xp.maximum(xp.abs(pack(delta)[:n // 2]), .05)
+        if xp is np:
+            preconditioner = LinearOperator((n, n), matvec=lambda x: np.concatenate([floor, floor]) * x, dtype=float)
+            operator = LinearOperator((n, n), matvec=hessian, dtype=float)
         for part, target in ((1, [w[s][nocc[s]:].conj() for s in range(2)]),
                              (1j, [1j * w[s][nocc[s]:].conj() for s in range(2)])):
             b = pack(target)
-            if not np.any(b):
+            if not xp.any(b):
                 continue
             # MINRES measures the residual in the preconditioner norm, i.e. roughly the error of z
-            z, status = minres(operator, b, M=preconditioner, rtol=self.tolerance, maxiter=self.max_iterations)
+            if xp is np:
+                z, status = minres(operator, b, M=preconditioner, rtol=self.tolerance, maxiter=self.max_iterations)
+            else:
+                from .gpu_response import solve_indefinite
+                z, status = solve_indefinite(hessian, b, xp.concatenate([floor, floor]),
+                                              self.tolerance, self.max_iterations)
             if status != 0:
-                raise RuntimeError("Z-vector MINRES did not converge")
+                raise RuntimeError("Z-vector indefinite solve did not converge")
             z = unpack(z)
-            coupling = coupling + part * sum(np.real(np.einsum("ai,bxai->bx", z[s].conj(), rhs[s])) for s in range(2))
+            coupling = coupling + part * sum(xp.real(xp.einsum("ai,bxai->bx", z[s].conj(), rhs[s])) for s in range(2))
         return coupling
 
     def _solve(self, hessian, preconditioner, target):
         """Diagonally preconditioned CG for the real-linear symmetric orbital hessian."""
+        xp = array_module(target)
         def inner(a, b):
-            return float(np.real(np.sum(a.conj() * b)))
+            return float(xp.real(xp.sum(a.conj() * b)))
         z = target / preconditioner
         residual = target - hessian(z)
         direction = residual / preconditioner
         rz = inner(residual, direction)
         for _ in range(self.max_iterations):
-            if np.max(np.abs(residual)) < self.tolerance:
+            if max_abs(residual) < self.tolerance:
                 return z
             h = hessian(direction)
             curvature = inner(direction, h)
@@ -327,6 +354,6 @@ class ZVectorNAC:
             z, residual = z + step * direction, residual - step * h
             rz, previous = inner(residual, residual / preconditioner), rz
             direction = residual / preconditioner + rz / previous * direction
-        if np.max(np.abs(residual)) < self.tolerance:
+        if max_abs(residual) < self.tolerance:
             return z
         raise RuntimeError("Z-vector conjugate gradient did not converge")

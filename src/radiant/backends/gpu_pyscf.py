@@ -24,7 +24,7 @@ class GPU4PySCFProvider(PySCFProvider):
                 or any(self.mf._numint.rsh_and_hybrid_coeff(self.mf.xc, spin=self.mf.mol.spin))):
             raise ValueError("GPU Focks require pure LDA/GGA RKS or UKS")
         self._gpu_mf = None
-        # Small-system grid-response GPU setup costs more than the CPU derivative.
+        # Derivative cost depends on model/device; preserve the legacy CPU default.
         self.gpu_forces = gpu_forces
 
     def __deepcopy__(self, memo):

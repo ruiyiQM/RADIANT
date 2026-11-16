@@ -32,6 +32,7 @@ import numpy as np
 from scipy.linalg import logm
 
 from .state import OrbitalState
+from .arrays import array_module
 
 
 class GaugeFailure(ValueError):
@@ -39,10 +40,11 @@ class GaugeFailure(ValueError):
 
 
 def align_phases(coefficients, reference, cross):
-    diagonal = np.einsum("ij,ij->j", reference.conj(), cross @ coefficients)
-    if np.any(np.abs(diagonal) <= 64 * np.finfo(float).eps):
+    xp = array_module(coefficients)
+    diagonal = xp.einsum("ij,ij->j", reference.conj(), cross @ coefficients)
+    if xp.any(xp.abs(diagonal) <= 64 * np.finfo(float).eps):
         raise GaugeFailure("Corresponding orbital overlap vanishes")
-    return coefficients * np.exp(-1j * np.angle(diagonal))
+    return coefficients * xp.exp(-1j * xp.angle(diagonal))
 
 
 def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
@@ -51,6 +53,7 @@ def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
     The normal paper path aligns active DTO orbitals to the last frame. FD
     aligns every orbital in both branches to the same central reference.
     """
+    xp = array_module(overlap)
     ground, excited = states
     if len(ground.coefficients) == 2 and len(excited.coefficients) == 2:
         return _unrestricted_pair(states, reference, cross, align_all)
@@ -62,9 +65,9 @@ def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
         raise ValueError("DTO requires a closed-shell ground and a two-active-orbital singlet")
     active = fe == 1
     projection = cg[:, fg == 2].conj().T @ overlap @ ce[:, active]
-    values, vectors = np.linalg.eigh(projection.conj().T @ projection)
+    values, vectors = xp.linalg.eigh(projection.conj().T @ projection)
     # This rejects numerical degeneracy, not a calibrated physical DTO gap.
-    if values[1] - values[0] <= 64 * np.finfo(float).eps * max(1., np.max(np.abs(values))):
+    if values[1] - values[0] <= 64 * np.finfo(float).eps * max(1., xp.max(xp.abs(values))):
         raise GaugeFailure("DTO hole/particle eigenvalues are degenerate")
     ce[:, active] = ce[:, active] @ vectors[:, ::-1]
     if reference is None:
@@ -74,7 +77,7 @@ def dto_pair(states, overlap, *, reference=None, cross=None, align_all=False):
         ce = align_phases(ce, reference[1].coefficients[0], cross)
     else:
         ce[:, active] = align_phases(ce[:, active], reference[1].coefficients[0][:, active], cross)
-    return (OrbitalState((cg,), (fg,)), OrbitalState((ce,), (fe,)))
+    return (ground.with_coefficients((cg,)), excited.with_coefficients((ce,)))
 
 
 def _unrestricted_pair(states, reference, cross, align_all):
@@ -86,8 +89,8 @@ def _unrestricted_pair(states, reference, cross, align_all):
         raise ValueError("Unrestricted DTO states need equal alpha and beta electron counts")
     if not align_all:
         return tuple(s.copy() for s in states)
-    return tuple(OrbitalState(tuple(align_phases(c, r, cross) for c, r in zip(s.coefficients, ref.coefficients)),
-                              s.occupations) for s, ref in zip(states, reference))
+    return tuple(s.with_coefficients(tuple(align_phases(c, r, cross)
+                 for c, r in zip(s.coefficients, ref.coefficients))) for s, ref in zip(states, reference))
 
 
 def _spin_counts(state):
@@ -98,6 +101,7 @@ def _spin_counts(state):
 
 def _determinants(state):
     """(alpha, beta, weight) determinants of a restricted singlet or one unrestricted determinant."""
+    xp = array_module(state.coefficients[0])
     if len(state.coefficients) == 2:
         alpha, beta = (c[:, f == 1] for c, f in zip(state.coefficients, state.occupations))
         return ((alpha, beta, 1.),)
@@ -107,8 +111,8 @@ def _determinants(state):
         return ((closed, closed, 1.),)
     if active.shape[1] != 2:
         raise ValueError("A restricted open singlet needs exactly two singly occupied orbitals")
-    h = np.column_stack((closed, active[:, 0]))
-    p = np.column_stack((closed, active[:, 1]))
+    h = xp.column_stack((closed, active[:, 0]))
+    p = xp.column_stack((closed, active[:, 1]))
     return ((h, p, 1 / np.sqrt(2)), (p, h, 1 / np.sqrt(2)))
 
 
@@ -117,16 +121,18 @@ def singlet_overlap(left, right, cross):
 
     An unrestricted state is one determinant of weight 1.
     """
+    xp = array_module(left.coefficients[0])
     if _spin_counts(left) != _spin_counts(right):
         raise ValueError("Alpha/beta electron counts differ")
-    return sum(wl * wr * np.linalg.det(al.conj().T @ cross @ ar)
-               * np.linalg.det(bl.conj().T @ cross @ br)
+    return sum(wl * wr * xp.linalg.det(al.conj().T @ cross @ ar)
+               * xp.linalg.det(bl.conj().T @ cross @ br)
                for al, bl, wl in _determinants(left)
                for ar, br, wr in _determinants(right))
 
 
 def pair_overlap(left, right, cross):
-    return np.array([[singlet_overlap(a, b, cross) for b in right] for a in left])
+    xp = array_module(left[0].coefficients[0])
+    return xp.stack([xp.stack([xp.asarray(singlet_overlap(a, b, cross)) for b in right]) for a in left])
 
 
 def overlap_coupling(overlap, interval):

@@ -33,7 +33,7 @@ An unconverged candidate is never returned as an accepted state.
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.linalg import cho_factor, cho_solve, cholesky, eigh, lu_factor, lu_solve, solve_triangular
+from .arrays import array_module, max_abs, cho_factor, cho_solve, cholesky, eigh, lu_factor, lu_solve, solve_triangular
 
 from .anderson import AndersonAcceleration
 from .state import OrbitalState
@@ -117,8 +117,18 @@ def _occupation_groups(state):
     therefore retained as physical dynamics.
     """
     if len(state.coefficients) == 2:
+        if array_module(state.coefficients[0]) is not np:
+            return tuple((spin, slice(0, f.size)) for spin, f in enumerate(state.occupations))
         return tuple((spin, np.arange(f.size)) for spin, f in enumerate(state.occupations))
     occupations = state.occupations[0]
+    if array_module(state.coefficients[0]) is not np:
+        groups = []
+        for value in (2, 1):
+            indices = np.flatnonzero(occupations == value)
+            if len(indices):
+                columns = slice(int(indices[0]), int(indices[-1]) + 1) if np.all(np.diff(indices) == 1) else indices
+                groups.append((0, columns))
+        return tuple(groups)
     return tuple((0, np.flatnonzero(occupations == value)) for value in (2, 1)
                  if np.any(occupations == value))
 
@@ -131,6 +141,7 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
     columns only. Signed dt is allowed for field-free probes; alpha scales
     electronics only.
     """
+    xp = array_module(overlap)
     if (not np.isfinite([time, dt, alpha]).all() or dt == 0 or alpha <= 0):
         raise ValueError("Require finite time, nonzero dt and positive alpha")
     lowdin(overlap)
@@ -141,10 +152,10 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
     nspin = len(state.coefficients)
 
     def evaluate(trial, t, iterations=0):
-        value = np.asarray(fock(trial.density(), t), dtype=complex)
+        value = xp.asarray(fock(trial.density(), t), dtype=complex)
         matrices = value[None] if nspin == 1 else value
-        if (matrices.shape != (nspin, *np.shape(overlap)) or not np.isfinite(matrices).all()
-                or not np.allclose(matrices, matrices.conj().transpose(0, 2, 1), atol=1e-12, rtol=0)):
+        if (matrices.shape != (nspin, *np.shape(overlap)) or not xp.isfinite(matrices).all()
+                or not xp.allclose(matrices, matrices.conj().transpose(0, 2, 1), atol=1e-12, rtol=0)):
             raise StepFailure("Fock provider returned invalid/non-Hermitian matrices", iterations=iterations)
         return matrices * alpha
 
@@ -152,9 +163,9 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
         return _parallel_transport(state, overlap, evaluate, time, dt, options)
 
     def solve(average):
-        return OrbitalState(tuple(np.linalg.solve(overlap + .5j * dt * h,
+        return state.with_coefficients(tuple(c.copy() if not c.shape[1] else xp.linalg.solve(overlap + .5j * dt * h,
                                 (overlap - .5j * dt * h) @ c)
-                                  for h, c in zip(average, state.coefficients)), state.occupations)
+                                  for h, c in zip(average, state.coefficients)))
 
     start = evaluate(state, time)
     guess = start.copy()
@@ -162,16 +173,16 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
     if options.variant == "cn":
         guess = evaluate(previous, time + dt)
     accelerator = AndersonAcceleration(history_size=6, regularization=1e-10)
-    residual = np.inf
+    residual = xp.inf
     try:
         for iteration in range(1, options.max_iterations + 1):
             candidate = solve((start + guess) / 2)
             final = evaluate(candidate, time + dt)
             average = (start + final) / 2
-            residual = max(float(np.max(np.abs(
-                (overlap + .5j * dt * h) @ new - (overlap - .5j * dt * h) @ old), initial=0))
+            residual = max(max_abs(
+                (overlap + .5j * dt * h) @ new - (overlap - .5j * dt * h) @ old)
                 for h, new, old in zip(average, candidate.coefficients, state.coefficients))
-            change = max(float(np.max(np.abs(new - old), initial=0))
+            change = max(max_abs(new - old)
                          for new, old in zip(candidate.coefficients, previous.coefficients))
             orthogonality = candidate.orthogonality_error(overlap)
             if (residual < options.tolerance and change < options.tolerance
@@ -191,6 +202,7 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
 
 def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
     """Frozen grouped occupied-energy preconditioner from d448adb PT.py."""
+    xp = array_module(overlap)
     if initial.shape[1] == 0:
         return lambda residual: residual.copy()
     values, vectors = eigh(initial.conj().T @ overlap @ initial)
@@ -199,19 +211,19 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
     occupied_ham = .5 * (occupied_ham + occupied_ham.conj().T)
     energies, rotation = eigh(occupied_ham)
     groups = [(0, len(energies))]
-    if len(energies) > 1 and np.max(np.diff(energies)) > 1e-12 * max(1, np.max(np.abs(energies))):
-        split = np.argmax(np.diff(energies)) + 1
+    if len(energies) > 1 and xp.max(xp.diff(energies)) > 1e-12 * max(1, xp.max(xp.abs(energies))):
+        split = int(xp.argmax(xp.diff(energies))) + 1
         groups = [(0, split), (split, len(energies))]
     while len(groups) < 4:
         spreads = [abs(half_dt) * (energies[end - 1] - energies[start]) for start, end in groups]
-        index = int(np.argmax(spreads))
+        index = int(np.argmax([float(v) for v in spreads]))
         if spreads[index] <= 1:
             break
         start, end = groups[index]
-        split = start + np.argmax(np.diff(energies[start:end])) + 1
+        split = start + int(xp.argmax(xp.diff(energies[start:end]))) + 1
         groups[index:index + 1] = [(start, split), (split, end)]
     factors = [lu_factor(overlap + 1j * half_dt *
-                        (hamiltonian - np.mean(energies[start:end]) * overlap))
+                        (hamiltonian - xp.mean(energies[start:end]) * overlap))
                for start, end in groups]
 
     def precondition(residual):
@@ -222,7 +234,7 @@ def _pt_preconditioner(overlap, hamiltonian, initial, half_dt):
             1 + 1j * half_dt * (energies[:, None] - energies[None, :]))
         occupied = normal + 1j * half_dt * (rotation @ hermitian @ rotation.conj().T) @ occupied_ham
         tangent_rhs = overlap @ (residual - reference @ normal) @ rotation
-        tangent = np.empty_like(tangent_rhs)
+        tangent = xp.empty_like(tangent_rhs)
         for (start, end), factor in zip(groups, factors):
             tangent[:, start:end] = lu_solve(factor, tangent_rhs[:, start:end])
         tangent -= reference @ (reference.conj().T @ overlap @ tangent)
@@ -259,7 +271,8 @@ def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half
     residual by the per-group tangent preconditioners, whose output is then
     S-orthogonalized to the joint frame.
     """
-    joint = np.concatenate(initials, axis=1)
+    xp = array_module(overlap)
+    joint = xp.concatenate(initials, axis=1)
     bounds = np.cumsum([0] + [c.shape[1] for c in initials])
     blocks = list(zip(bounds[:-1], bounds[1:]))
     energies = joint.conj().T @ hamiltonian @ joint
@@ -267,7 +280,7 @@ def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half
     bases = [eigh(energies[lo:hi, lo:hi]) for lo, hi in blocks]
 
     def precondition(residuals):
-        residual = np.concatenate(residuals, axis=1)
+        residual = xp.concatenate(residuals, axis=1)
         coordinates = joint.conj().T @ overlap @ residual
         step = coordinates.copy()
         for g, (glo, ghi) in enumerate(blocks):
@@ -283,7 +296,7 @@ def _midpoint_group_preconditioner(overlap, hamiltonian, initials, natives, half
                 step[glo:ghi, klo:khi] = -ug @ forward @ uk.conj().T
                 step[klo:khi, glo:ghi] = -uk @ backward.T.conj() @ ug.conj().T
         tangent = residual - joint @ coordinates
-        tangent = np.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
+        tangent = xp.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
         tangent -= joint @ (joint.conj().T @ overlap @ tangent)
         total = joint @ step + tangent
         return [total[:, lo:hi] for lo, hi in blocks]
@@ -298,17 +311,18 @@ def _midpoint_phi(overlap, metric_factor, hamiltonian, mids):
     Hermitian, so M^H S phi is Hermitian and the root keeps the full Gram,
     including the orthogonality between groups, without any projection.
     """
-    joint = np.concatenate(mids, axis=1)
+    xp = array_module(overlap)
+    joint = xp.concatenate(mids, axis=1)
     if not joint.shape[1]:
         return [m.copy() for m in mids]
     hm = hamiltonian @ joint
     energies = joint.conj().T @ hm
     bounds = np.cumsum([0] + [m.shape[1] for m in mids])
-    gauge = np.zeros_like(energies)
+    gauge = xp.zeros_like(energies)
     for lo, hi in zip(bounds[:-1], bounds[1:]):
         gauge[lo:hi, lo:hi] = energies[lo:hi, lo:hi]
     phi = (cho_solve(metric_factor, hm)
-           - joint @ np.linalg.solve(joint.conj().T @ overlap @ joint, gauge))
+           - joint @ xp.linalg.solve(joint.conj().T @ overlap @ joint, gauge))
     return [phi[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]
 
 
@@ -344,14 +358,15 @@ def _hamc_fock_orbitals(overlap, mids, occupations):
     carry the Fock density sum_g f_g X_g X_g^H = Cb p(Gb) Cb^H, the midpoint
     orbitals Loewdin-normalized within each cluster.
     """
-    f = np.concatenate(occupations)
-    root = np.sqrt(f)
-    jb = np.concatenate(mids, axis=1) * root
+    xp = array_module(overlap)
+    f = xp.concatenate([xp.asarray(f) for f in occupations])
+    root = xp.sqrt(f)
+    jb = xp.concatenate(mids, axis=1) * root
     lam, vectors = eigh(jb.conj().T @ overlap @ jb)
-    fc = np.sort(f)
+    fc = xp.sort(f)
     pv = fc / lam
     bounds = np.cumsum([0] + [m.shape[1] for m in mids])
-    x = (jb @ ((vectors * np.sqrt(pv)) @ vectors.conj().T)) / root
+    x = (jb @ ((vectors * xp.sqrt(pv)) @ vectors.conj().T)) / root
     return ([x[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])],
             (root, jb, lam, vectors, fc, pv, bounds))
 
@@ -364,11 +379,12 @@ def _hamc_phi(overlap, metric_factor, hamiltonian, data):
     derivative Dp: divided differences of p between clusters and
     -f_c / (lam_i lam_j) within one, written without cancellation.
     """
+    xp = array_module(overlap)
     root, jb, lam, vectors, fc, pv, bounds = data
     hm = hamiltonian @ jb
     same = fc[:, None] == fc[None, :]
-    diff = np.where(same, 1., lam[:, None] - lam[None, :])
-    dd = np.where(same, -fc[:, None] / (lam[:, None] * lam[None, :]), (pv[:, None] - pv[None, :]) / diff)
+    diff = xp.where(same, 1., lam[:, None] - lam[None, :])
+    dd = xp.where(same, -fc[:, None] / (lam[:, None] * lam[None, :]), (pv[:, None] - pv[None, :]) / diff)
     dpb = vectors @ (dd * (vectors.conj().T @ (jb.conj().T @ hm) @ vectors)) @ vectors.conj().T
     phi = (cho_solve(metric_factor, hm @ ((vectors * pv) @ vectors.conj().T)) + jb @ dpb) / root
     return [phi[:, lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]
@@ -394,40 +410,42 @@ def _hamc_occupied_solver(energies, occupations, dt):
     L[i, j, a, b] = A[i, j, a] delta_jb + B[i, j, b] delta_ia and
     K[i, j, a, b] = C[i, j, b] delta_ja + D[i, j, a] delta_ib.
     """
-    f = np.asarray(occupations, float)
+    xp = array_module(energies)
+    f = xp.asarray(occupations, float)
     count = len(f)
-    root = np.sqrt(f)
+    root = xp.sqrt(f)
     same = f[:, None] == f[None, :]
-    p1 = np.where(same, -1. / f[:, None], 0.)
+    p1 = xp.where(same, -1. / f[:, None], 0.)
     twos = (f == 2.).astype(int)
     multiplicity = twos[:, None, None] + twos[None, :, None] + twos[None, None, :]
-    p2 = np.choose(multiplicity, [1., 1., -.5, .25])
+    p2 = xp.choose(multiplicity, xp.asarray([1., 1., -.5, .25]))
     b0 = root[:, None] * energies * root[None, :]
     d0 = p1 * b0
 
-    eye = np.eye(count)
+    eye = xp.eye(count)
     # E R (p1 o dg): energies[i, x] f[x] p1[x, j] r[j] / 2 on Delta[x, j] and conj(Delta[j, x]).
     shared = (energies * f[None, :])[:, None, :] * p1.T[None, :, :] * root[None, :, None] / 2
     # R (p1 o db): r[i]^2 r[j] p1[i, j] / 2 times E[i, a] on Delta[a, j] and E[a, j] on conj(Delta[a, i]).
     weight = f[:, None] * root[None, :] * p1 / 2
     # R d2: p2 terms from dg[i, k] (first) and dg[k, j] (second).
-    first = np.einsum('i,b,ibj,bj->ijb', f, root, p2, b0) / 2
-    second = np.einsum('i,a,j,iaj,ia->ija', root, root, root, p2, b0) / 2
+    first = xp.einsum('i,b,ibj,bj->ijb', f, root, p2, b0) / 2
+    second = xp.einsum('i,a,j,iaj,ia->ija', root, root, root, p2, b0) / 2
     a = energies[:, None, :] * root[None, :, None] / 2 + shared + weight[:, :, None] * energies[:, None, :] + second
     b = (root[:, None] * d0).T[None] / 2 + first
     c = shared + second
     d = weight[:, :, None] * energies.T[None, :, :] + first
-    linear = np.einsum('ija,jb->ijab', a, eye) + np.einsum('ijb,ia->ijab', b, eye)
-    conjugate = np.einsum('ijb,ja->ijab', c, eye) + np.einsum('ija,ib->ijab', d, eye)
+    linear = xp.einsum('ija,jb->ijab', a, eye) + xp.einsum('ijb,ia->ijab', b, eye)
+    conjugate = xp.einsum('ijb,ja->ijab', c, eye) + xp.einsum('ija,ib->ijab', d, eye)
     scale = (-1j * dt / root)[None, :, None, None]
     size = count * count
-    linear = (scale * linear - np.einsum('ia,jb->ijab', eye, eye)).reshape(size, size)
+    linear = (scale * linear - xp.einsum('ia,jb->ijab', eye, eye)).reshape(size, size)
     conjugate = (scale * conjugate).reshape(size, size)
     plus, minus = linear + conjugate, linear - conjugate
-    factor = lu_factor(np.block([[plus.real, -minus.imag], [plus.imag, minus.real]]))
+    factor = lu_factor(xp.concatenate((xp.concatenate((plus.real, -minus.imag), axis=1),
+                                           xp.concatenate((plus.imag, minus.real), axis=1)), axis=0))
 
     def solve(coordinates):
-        x = lu_solve(factor, np.concatenate([coordinates.real.ravel(), coordinates.imag.ravel()]))
+        x = lu_solve(factor, xp.concatenate([coordinates.real.ravel(), coordinates.imag.ravel()]))
         return (x[:size] + 1j * x[size:]).reshape(count, count)
     return solve
 
@@ -439,21 +457,22 @@ def _hamc_group_preconditioner(overlap, hamiltonian, initials, natives, dt, occu
     by the inverse of _hamc_occupied_solver, which keeps the inter-group
     blocks of E that the closed-form pairs neglect.
     """
-    joint = np.concatenate(initials, axis=1)
+    xp = array_module(overlap)
+    joint = xp.concatenate(initials, axis=1)
     bounds = np.cumsum([0] + [c.shape[1] for c in initials])
     blocks = list(zip(bounds[:-1], bounds[1:]))
-    f = np.concatenate([np.full(c.shape[1], o) for c, o in zip(initials, occupations)])
-    if not set(np.unique(f)) <= {1., 2.}:
+    f = xp.concatenate([xp.full(c.shape[1], o) for c, o in zip(initials, occupations)])
+    if not xp.all((f == 1.) | (f == 2.)):
         raise ValueError("The hamc occupied-span preconditioner is derived for 2/1 groups only")
     energies = joint.conj().T @ hamiltonian @ joint
     solve = _hamc_occupied_solver(.5 * (energies + energies.conj().T), f, dt)
 
     def precondition(residuals):
-        residual = np.concatenate(residuals, axis=1)
+        residual = xp.concatenate(residuals, axis=1)
         coordinates = joint.conj().T @ overlap @ residual
         step = -solve(coordinates)
         tangent = residual - joint @ coordinates
-        tangent = np.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
+        tangent = xp.concatenate([native(tangent[:, lo:hi]) for native, (lo, hi) in zip(natives, blocks)], axis=1)
         tangent -= joint @ (joint.conj().T @ overlap @ tangent)
         total = joint @ step + tangent
         return [total[:, lo:hi] for lo, hi in blocks]
@@ -508,6 +527,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
     decides convergence. The switching iteration builds the midpoint Fock
     twice.
     """
+    xp = array_module(overlap)
     midpoint = options.variant == "pt_im"
     label = "PT-IM" if midpoint else "PT-CN"
     groups = _occupation_groups(state)
@@ -516,15 +536,16 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                for spin in range(len(state.coefficients))]
     hamc_spins = [spin for spin, group in enumerate(members) if midpoint and len(group) > 1]
     initial = [state.coefficients[spin][:, columns] for spin, columns in groups]
+    weights = [xp.asarray(state.occupations[spin][columns]) for spin, columns in groups]
     blocks = [c.copy() for c in initial]
     sizes = np.cumsum([0] + [c.size for c in initial])
-    residual, change, iteration = np.inf, 0., 0
+    residual, change, iteration = xp.inf, 0., 0
 
     def assemble(parts):
-        coefficients = [np.empty_like(c) for c in state.coefficients]
+        coefficients = [xp.empty_like(c) for c in state.coefficients]
         for (spin, columns), part in zip(groups, parts):
             coefficients[spin][:, columns] = part
-        return OrbitalState(tuple(coefficients), state.occupations)
+        return state.with_coefficients(tuple(coefficients))
 
     try:
         metric_factor = cho_factor(overlap)
@@ -556,13 +577,13 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 frames = [.5 * (c0 + c) for c0, c in zip(initial, parts)]
                 gram_min = [0.] * len(members)
                 for spin, group in enumerate(members):
-                    joint = np.concatenate([frames[i] for i in group], axis=1)
+                    joint = xp.concatenate([frames[i] for i in group], axis=1)
                     if not joint.shape[1]:
                         continue
                     values, vectors = eigh(joint.conj().T @ overlap @ joint)
                     gram_min[spin] = values[0]
                     if values[0] <= 1e-8:
-                        joint = np.concatenate([initial[i] for i in group], axis=1)
+                        joint = xp.concatenate([initial[i] for i in group], axis=1)
                     else:
                         joint = joint @ ((vectors * values**-.5) @ vectors.conj().T)
                     bounds = np.cumsum([0] + [initial[i].shape[1] for i in group])
@@ -598,7 +619,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                         group = members[spin]
                         xs, data[spin] = _hamc_fock_orbitals(
                             overlap, [mids[i] for i in group],
-                            [state.occupations[spin][groups[i][1]] for i in group])
+                            [weights[i] for i in group])
                         for i, x in zip(group, xs):
                             orbitals[i] = x
                 middle = evaluate(assemble(orbitals), time + half_dt, iteration)
@@ -625,7 +646,7 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
         first, follow, hamc = None, False, False
         for iteration in range(1, options.max_iterations + 1):
             errors = errors_of(blocks, iteration, hamc) if midpoint else errors_of(blocks, iteration)
-            residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
+            residual = float(xp.linalg.norm(xp.stack([xp.linalg.norm(r) for r in errors])))
             first = residual if first is None else first
             if not np.isfinite(residual):
                 raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
@@ -635,12 +656,12 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 hamc = True
                 accelerator = AndersonAcceleration(history_size=options.history, regularization=1e-12)
                 errors = errors_of(blocks, iteration, hamc)
-                residual = float(np.linalg.norm([np.linalg.norm(r) for r in errors]))
+                residual = float(xp.linalg.norm(xp.stack([xp.linalg.norm(r) for r in errors])))
                 if not np.isfinite(residual):
                     raise StepFailure(f"{label} residual is not finite", residual=residual, iterations=iteration)
             if residual <= options.tolerance:
                 break
-            current = np.concatenate([c.ravel() for c in blocks])
+            current = xp.concatenate([c.ravel() for c in blocks])
             if midpoint:
                 # The preconditioner changes with the iterate; Anderson mixing
                 # tolerated this better than periodic rebuilds with a history reset.
@@ -648,18 +669,18 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 steps = midpoint_steps(blocks if follow else initial, errors, hamc)
             else:
                 steps = [precondition(r) for r, precondition in zip(errors, preconditioners)]
-            candidate = np.concatenate([(c + step).ravel() for c, step in zip(blocks, steps)])
+            candidate = xp.concatenate([(c + step).ravel() for c, step in zip(blocks, steps)])
             # Scale the Tikhonov term with the update for every block count: a
             # fixed value swamps the shrinking history near convergence, which
             # turns Anderson off and stalls large alpha*dt steps.
-            accelerator.regularization = 1e-12 * np.linalg.norm(candidate - current)**2
+            accelerator.regularization = 1e-12 * xp.linalg.norm(candidate - current)**2
             # Real mixing retains the real-linear dependence on C and C*.
-            mixed = accelerator.compute(np.stack((current.real, current.imag)),
-                                        np.stack((candidate.real, candidate.imag)))
+            mixed = accelerator.compute(xp.stack((current.real, current.imag)),
+                                        xp.stack((candidate.real, candidate.imag)))
             vector = mixed[0] + 1j * mixed[1]
-            if not np.isfinite(vector).all():
+            if not xp.isfinite(vector).all():
                 raise StepFailure(f"{label} trial orbitals are not finite", residual=residual, iterations=iteration)
-            change = float(np.max(np.abs(vector - current), initial=0))
+            change = max_abs(vector - current)
             blocks = [vector[sizes[i]:sizes[i+1]].reshape(c.shape) for i, c in enumerate(initial)]
         else:
             raise StepFailure(f"{label} nonlinear iteration did not converge", residual=residual,
@@ -672,11 +693,11 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             # returned_residual is not evaluated to avoid an extra Fock build.
             raw_orthogonality = 0.
             for group in members:
-                joint = np.concatenate([blocks[i] for i in group], axis=1)
+                joint = xp.concatenate([blocks[i] for i in group], axis=1)
                 if joint.shape[1]:
                     gram = joint.conj().T @ overlap @ joint
                     raw_orthogonality = max(raw_orthogonality,
-                                            float(np.max(np.abs(gram - np.eye(len(gram))))))
+                                            float(xp.max(xp.abs(gram - xp.eye(len(gram))))))
                     values, vectors = eigh(gram)
                     joint = joint @ ((vectors * values**-.5) @ vectors.conj().T)
                 bounds = np.cumsum([0] + [blocks[i].shape[1] for i in group])
@@ -687,17 +708,17 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             if raw_orthogonality > 1e-6 or orthogonality > 1e-8:
                 raise StepFailure("PT-IM orthogonality failed", residual=residual, iterations=iteration)
             return accepted, Convergence(iteration, residual, change, orthogonality,
-                                         raw_orthogonality, np.nan)
+                                         raw_orthogonality, xp.nan)
 
         # Orthonormalize each spin jointly in group order (doubly occupied
         # first), so the leading group's span is kept and groups end orthogonal.
         raw_orthogonality = 0.
         for spin, group in enumerate(members):
-            joint = np.concatenate([blocks[i] for i in group], axis=1)
+            joint = xp.concatenate([blocks[i] for i in group], axis=1)
             if joint.shape[1]:
                 gram = joint.conj().T @ overlap @ joint
                 raw_orthogonality = max(raw_orthogonality,
-                                        float(np.max(np.abs(gram - np.eye(len(gram))))))
+                                        float(xp.max(xp.abs(gram - xp.eye(len(gram))))))
                 root = cholesky(gram, lower=True)
                 joint = solve_triangular(root, joint.conj().T, lower=True).conj().T
             bounds = np.cumsum([0] + [blocks[i].shape[1] for i in group])
@@ -705,9 +726,9 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
                 blocks[i] = joint[:, bounds[k]:bounds[k + 1]]
         accepted = assemble(blocks)
         returned = evaluate(accepted, time + dt, iteration)
-        returned_residual = float(np.linalg.norm([
-            np.linalg.norm(r - c - 1j * half_dt * action(c, returned[s]))
-            for r, c, s in zip(rhs, blocks, spins)]))
+        returned_residual = float(xp.linalg.norm(xp.stack([
+            xp.linalg.norm(r - c - 1j * half_dt * action(c, returned[s]))
+            for r, c, s in zip(rhs, blocks, spins)])))
         orthogonality = accepted.orthogonality_error(overlap)
         if orthogonality > 1e-8:
             raise StepFailure("PT-CN orthogonality failed", residual=residual, iterations=iteration)

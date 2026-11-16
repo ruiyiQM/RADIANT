@@ -17,6 +17,7 @@ import numpy as np
 
 from .core.coupling import PaperFD
 from .core.execution import LocalExecution, Observation, _force_states
+from .core.arrays import to_host
 from .core.propagation import CNOptions
 from .core.state import NuclearState, OrbitalState
 from .driver import HOP_EVENT_DTYPE, Trajectory
@@ -47,7 +48,8 @@ def _model(provider):
     from pyscf import dft, scf
     from .backends.pyscf import PySCFProvider
     from .backends.gpu_pyscf import GPU4PySCFProvider
-    if type(provider) not in (PySCFProvider, GPU4PySCFProvider):
+    from .backends.gpu_resident import GPUResidentProvider
+    if type(provider) not in (PySCFProvider, GPU4PySCFProvider, GPUResidentProvider):
         raise ValueError("Restart requires a built-in PySCF or GPU4PySCF provider")
     mf, mol = provider.mf, provider.mf.mol
     if type(mf) not in (scf.hf.RHF, scf.uhf.UHF, dft.rks.RKS, dft.uks.UKS):
@@ -55,7 +57,8 @@ def _model(provider):
     if any(k != "get_occ" and (inspect.isroutine(v) or
             (callable(v) and callable(getattr(type(mf), k, None)))) for k, v in vars(mf).items()):
         raise ValueError("Restart cannot preserve custom mean-field methods")
-    result = {"provider": type(provider).__name__, "mean_field": type(mf).__name__,
+    name = "GPU4PySCFProvider" if isinstance(provider, GPU4PySCFProvider) else type(provider).__name__
+    result = {"provider": name, "mean_field": type(mf).__name__,
               "density_convention": provider.density_convention,
               "symbols": [mol.atom_symbol(i) for i in range(mol.natm)],
               "charges": mol.atom_charges(), "basis": mol._basis, "cart": mol.cart,
@@ -88,12 +91,12 @@ def _nac_settings(nac):
 
 def _write_state(arrays, prefix, state):
     for spin, (c, f) in enumerate(zip(state.coefficients, state.occupations)):
-        arrays[f"{prefix}_c{spin}"] = c
+        arrays[f"{prefix}_c{spin}"] = to_host(c)
         arrays[f"{prefix}_f{spin}"] = f
 
 
-def _read_state(arrays, prefix, nspin):
-    return OrbitalState(tuple(arrays[f"{prefix}_c{s}"] for s in range(nspin)),
+def _read_state(arrays, prefix, nspin, xp=np):
+    return OrbitalState(tuple(xp.asarray(arrays[f"{prefix}_c{s}"]) for s in range(nspin)),
                         tuple(arrays[f"{prefix}_f{s}"] for s in range(nspin)))
 
 
@@ -103,6 +106,9 @@ def save_checkpoint(run, path):
     execution = run.execution
     if type(execution) is not LocalExecution:
         raise ValueError("Restart requires LocalExecution")
+    for provider in execution.providers:
+        if hasattr(provider, "capture_grids"):
+            provider.capture_grids()
     models = [_model(p) for p in execution.providers]
     if run.method is not None and (type(run.method) is not MASH or set(vars(run.method)) != {"coefficients"}):
         raise ValueError("Restart requires the built-in MASH method")
@@ -176,16 +182,17 @@ def load_checkpoint(path, providers):
             if hasattr(provider, "gpu_forces"):
                 if type(mode) is not bool:
                     raise ValueError("Invalid checkpoint GPU force mode")
-                provider.gpu_forces = mode
+                provider.gpu_forces = mode or getattr(provider, "device_resident", False)
             elif mode is not None:
                 raise ValueError("CPU provider cannot request GPU forces")
         states, gauge = [], []
         for i, provider in enumerate(candidates):
             provider.prepare_geometry(nuclei.positions)
             nspin = 2 if provider.unrestricted else 1
-            states.append(_read_state(arrays, f"state{i}", nspin))
+            xp = getattr(provider, "array_module", np)
+            states.append(_read_state(arrays, f"state{i}", nspin, xp))
             if len(providers) == 2:
-                gauge.append(_read_state(arrays, f"gauge{i}", nspin))
+                gauge.append(_read_state(arrays, f"gauge{i}", nspin, xp))
             for key in _MO_FIELDS:
                 value = arrays[f"mf{i}_{key}"] if key in info["stored"][i] else None
                 if value is not None and not np.isfinite(value).all():
@@ -210,12 +217,16 @@ def load_checkpoint(path, providers):
                     raise ValueError("Invalid checkpoint quadrature shape")
             provider.mf._opt = {}
             provider.mf._eri = None
+            if getattr(provider, "device_resident", False):
+                # Rebuild from the restored quadrature, never from transient GPU caches.
+                provider._gpu_mf = None
         execution = LocalExecution(candidates, states, alphas=info["alphas"],
                                    options=CNOptions(**info["options"]), time=info["time"])
         if gauge:
+            xp = getattr(candidates[0], "array_module", np)
             for state, frame in zip(execution.states, gauge):
                 if (frame.orthogonality_error(candidates[0].overlap) > 1e-8 or
-                        not np.allclose(frame.density(), state.density(), atol=1e-10, rtol=0)):
+                        not xp.allclose(frame.density(), state.density(), atol=1e-10, rtol=0)):
                     raise ValueError("Checkpoint DTO gauge does not match its state")
             execution.gauge = tuple(gauge)
         method = None
