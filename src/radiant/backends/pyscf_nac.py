@@ -185,8 +185,9 @@ class ZVectorNAC:
             mf.mo_coeff, mf.mo_occ = mo, occ
         response = mf.gen_response(mo, occ, hermi=1)
         s1 = c.conj().T @ ds @ co
-        h1 = provider.response_h1(mf, mo, occ) if getattr(provider, "device_resident", False) else mf.Hessian().make_h1(mo, occ)
-        f1 = cv.conj().T @ xp.asarray(h1) @ co
+        f1 = (provider.response_h1(mf, mo, occ, left=cv, right=co)
+              if getattr(provider, "device_resident", False)
+              else cv.conj().T @ xp.asarray(mf.Hessian().make_h1(mo, occ)) @ co)
 
         def kernel(dm):
             v = xp.asarray(response(dm.reshape(-1, *dm.shape[-2:]))).reshape(dm.shape)
@@ -273,7 +274,10 @@ class ZVectorNAC:
         else:
             mf.mo_coeff, mf.mo_occ = mo, occ
         response = mf.gen_response(mo, occ, hermi=1)
-        h1 = provider.response_h1(mf, mo, occ) if getattr(provider, "device_resident", False) else mf.Hessian().make_h1(mo, occ)
+        f1 = (provider.response_h1(mf, mo, occ, left=cv, right=co)
+              if getattr(provider, "device_resident", False)
+              else [cv[s].conj().T @ xp.asarray(h) @ co[s]
+                    for s, h in enumerate(mf.Hessian().make_h1(mo, occ))])
         delta = [es[s][nocc[s]:, None] - es[s][None, :nocc[s]] for s in range(2)]
         s1 = [cs[s].conj().T @ ds @ co[s] for s in range(2)]
 
@@ -288,7 +292,7 @@ class ZVectorNAC:
 
         u_occ = [-.5 * s1[s][..., :nocc[s], :] for s in range(2)]
         k_occ = kernel(u_occ, co)
-        rhs = [-(cv[s].conj().T @ xp.asarray(h1[s]) @ co[s] - s1[s][..., nocc[s]:, :] * es[s][:nocc[s]]) - k_occ[s]
+        rhs = [-(f1[s] - s1[s][..., nocc[s]:, :] * es[s][:nocc[s]]) - k_occ[s]
                for s in range(2)]
         coupling = sum(xp.einsum("axij,ji->ax", basis, t[s]) + xp.einsum("axij,ij->ax", u_occ[s], w[s][:nocc[s]])
                        for s in range(2))

@@ -28,8 +28,10 @@ def response_model(provider, mo, occ):
     return model
 
 
-def ao_derivative(provider, model, mo, occ):
-    """Recover AO H1 from GPU4PySCF's occupied-column Hessian interface."""
+def ao_derivative(provider, model, mo, occ, *, left=None, right=None):
+    """Project occupied-column H1 directly; retain AO recovery for diagnostics."""
+    if (left is None) != (right is None):
+        raise ValueError("Supply both left and right derivative projection blocks")
     xp = provider.array_module
     inverse, half = lowdin(provider.overlap)
     blocks = mo if provider.unrestricted else (mo,)
@@ -57,12 +59,19 @@ def ao_derivative(provider, model, mo, occ):
     result = hessian.make_h1(hmodel.mo_coeff, hmodel.mo_occ)
     blocks = result if provider.unrestricted else (result,)
     outputs = []
-    for basis, scale, block in zip(bases, scales, blocks):
+    for spin, (basis, scale, block) in enumerate(zip(bases, scales, blocks)):
         if not hasattr(block, '__cuda_array_interface__'):
             raise TypeError("GPU Hessian exported its derivative matrix to the host")
         inverse_basis = basis.T @ provider.overlap
-        unscaled = block / scale[None, None, :, None] / scale[None, None, None, :]
-        outputs.append(inverse_basis.T @ unscaled @ inverse_basis)
+        if left is None:
+            unscaled = block / scale[None, None, :, None] / scale[None, None, None, :]
+            outputs.append(inverse_basis.T @ unscaled @ inverse_basis)
+        else:
+            l = left[spin] if provider.unrestricted else left
+            r = right[spin] if provider.unrestricted else right
+            l = (inverse_basis @ l) / scale[:, None]
+            r = (inverse_basis @ r) / scale[:, None]
+            outputs.append(l.conj().T @ (block @ r))
     return outputs if provider.unrestricted else outputs[0]
 
 

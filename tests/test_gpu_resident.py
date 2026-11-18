@@ -190,6 +190,18 @@ class ResidentHardwareTests(unittest.TestCase):
                 expected = mf.Hessian().make_h1(mf.mo_coeff, mf.mo_occ)
                 for a, b in zip(actual if unrestricted else (actual,), expected if unrestricted else (expected,)):
                     assert_allclose(to_host(a), b, atol=3e-7, rtol=0)
+                rng = np.random.default_rng(97)
+                n = mf.mol.nao
+                left = [cp.asarray(rng.normal(size=(n, n-1)) + 1j*rng.normal(size=(n, n-1)))
+                        for _ in blocks]
+                right = [cp.asarray(rng.normal(size=(n, 2)) + 1j*rng.normal(size=(n, 2)))
+                         for _ in blocks]
+                projected = gpu.response_h1(model, mo, occ,
+                    left=left if unrestricted else left[0], right=right if unrestricted else right[0])
+                for l, r, a, b in zip(left, right, projected if unrestricted else (projected,),
+                                      expected if unrestricted else (expected,)):
+                    reference = to_host(l).conj().T @ b @ to_host(r)
+                    assert_allclose(to_host(a), reference, atol=3e-7, rtol=0)
                 for step in range(2):
                     if step:
                         for run in runs:

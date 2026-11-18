@@ -210,6 +210,6 @@ class GPUResidentProvider(GPU4PySCFProvider):
         from .gpu_response import response_model
         return response_model(self, mo, occ)
 
-    def response_h1(self, model, mo, occ):
+    def response_h1(self, model, mo, occ, *, left=None, right=None):
         from .gpu_response import ao_derivative
-        return ao_derivative(self, model, mo, occ)
+        return ao_derivative(self, model, mo, occ, left=left, right=right)
