@@ -13,6 +13,8 @@ def response_model(provider, mo, occ):
     model = copy(native)
     model._numint = copy(native._numint)
     model.grids = native.grids.copy()
+    if hasattr(native, "with_df"):
+        model.with_df = copy(native.with_df)
     model._opt_gpu = dict(native._opt_gpu or {})
     model._opt_jengine = dict(native._opt_jengine or {})
     if provider.unrestricted:
@@ -51,9 +53,9 @@ def ao_derivative(provider, model, mo, occ, *, left=None, right=None):
     # GPU4PySCF drops the numerical integrator when copying an SCF object.
     hmodel._numint = model._numint
     hmodel.grids = model.grids
-    hmodel.mo_coeff = fulls if provider.unrestricted else fulls[0]
+    hmodel.mo_coeff = xp.stack(fulls) if provider.unrestricted else fulls[0]
     occupations = [xp.full(f.shape[1], occupation) for f in fulls]
-    hmodel.mo_occ = occupations if provider.unrestricted else occupations[0]
+    hmodel.mo_occ = xp.stack(occupations) if provider.unrestricted else occupations[0]
     hessian = hmodel.Hessian()
     hessian.grid_response = False
     result = hessian.make_h1(hmodel.mo_coeff, hmodel.mo_occ)

@@ -40,6 +40,16 @@ file = "trajectory.npz"
 
 
 class InputTests(unittest.TestCase):
+    def test_pure_dft_auxiliary_basis_selects_df_j(self):
+        text = INPUT.replace('model = "rhf"', 'model = "rks"\nxc = "pbe"\nauxbasis = "weigend"')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'input.toml'; path.write_text(text)
+            run = run_toml(path)
+            mf = run.execution.providers[0].mf
+            self.assertEqual(mf.with_df.auxbasis, 'weigend')
+            self.assertTrue(mf.only_dfj)
+            self.assertEqual(run.time, .2)
+
     def test_toml_runs_and_writes_only_in_its_output_directory(self):
         for variant in ("cn_accelerated", "pt_cn", "pt_im"):
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as folder:
@@ -59,6 +69,8 @@ class InputTests(unittest.TestCase):
     def test_units_unknown_fields_and_unprepared_excited_state_are_rejected(self):
         for text in (INPUT.replace('unit = "Bohr"','unit = "angstrom"'),
                      INPUT.replace('initial = "scf"','initial = "excited"'),
+                     INPUT.replace('basis = "sto-3g"','basis = "sto-3g"\nauxbasis = ""'),
+                     INPUT.replace('basis = "sto-3g"','basis = "sto-3g"\nauxbasis = 1'),
                      INPUT.replace('alpha = 2.0','alpha = 2.0\nmu = 3.0')):
             with tempfile.TemporaryDirectory() as folder:
                 path=Path(folder)/"input.toml";path.write_text(text)

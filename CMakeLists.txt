@@ -9,7 +9,7 @@ if(BUILD_TESTING)
     if(NOT dependency_status EQUAL 0)
         message(FATAL_ERROR "Regression environment requires NumPy, SciPy and PySCF >=2.12: ${dependency_error}")
     endif()
-    foreach(suite numerics propagation pt_cn pt_mixed pt_im two_state_pt adiabatic pyscf gpu_provider gpu_resident execution restart mash input)
+    foreach(suite numerics propagation pt_cn pt_mixed pt_im two_state_pt adiabatic pyscf density_fitting gpu_provider gpu_resident execution restart mash input)
         add_test(NAME ${suite} COMMAND "${Python3_EXECUTABLE}" -m unittest discover
             -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p "test_${suite}.py" -v)
         set_tests_properties(${suite} PROPERTIES
@@ -17,5 +17,5 @@ if(BUILD_TESTING)
             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
             LABELS "regression" TIMEOUT 120)
     endforeach()
-    set_tests_properties(gpu_provider gpu_resident PROPERTIES TIMEOUT 600)
+    set_tests_properties(gpu_provider gpu_resident density_fitting PROPERTIES TIMEOUT 600)
 endif()

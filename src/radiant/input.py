@@ -20,13 +20,14 @@ def run_toml(path):
     Required sections are system, backend, state and trajectory. The system
     supplies an inline PySCF atom string, explicit Bohr units, nuclear masses
     (electron masses), and momenta (a.u.). State.initial must be 'scf'.
+    Optional backend.auxbasis enables density-fitted J for pure LDA/GGA.
     """
     path = Path(path)
     with path.open("rb") as stream:
         config = tomllib.load(stream)
     allowed = {
         "system": {"atoms", "unit", "charge", "spin", "masses", "momenta"},
-        "backend": {"model", "basis", "xc", "density_convention"},
+        "backend": {"model", "basis", "xc", "density_convention", "auxbasis"},
         "state": {"initial", "alpha"},
         "propagation": {"variant", "tolerance", "max_iterations", "history"},
         "trajectory": {"dt", "steps", "n_substeps"},
@@ -66,6 +67,10 @@ def run_toml(path):
     mf.chkfile = None
     if model.endswith("ks"):
         mf.xc = backend["xc"]
+    if "auxbasis" in backend:
+        if not isinstance(backend["auxbasis"], str) or not backend["auxbasis"].strip():
+            raise ValueError("auxbasis must name a density-fitting auxiliary basis")
+        mf = mf.density_fit(auxbasis=backend["auxbasis"], only_dfj=True)
     mf.kernel()
     provider = PySCFProvider(mf, density_convention=backend.get("density_convention", "complex"))
     execution = LocalExecution([provider], alphas=[state["alpha"]], options=options)

@@ -26,6 +26,7 @@
 PySCF is a local provider, not a propagator. No SCF is run after construction.
 The optional paper_real convention explicitly reproduces the restricted
 TDMASH v0.1.0 density approximation; complex is the native PySCF functional.
+Pure LDA/GGA also accepts standard mf.density_fit(auxbasis=..., only_dfj=True).
 """
 
 from copy import deepcopy
@@ -64,8 +65,15 @@ class PySCFProvider:
     def _validate_model(self):
         if self.mf.mol.has_ecp() or self.mf.mol._pseudo:
             raise ValueError("ECP/pseudopotential forces are not validated")
-        if hasattr(self.mf, "with_df") or getattr(self.mf, "with_x2c", None) is not None:
-            raise ValueError("Density fitting and relativistic forces are not validated")
+        if getattr(self.mf, "with_x2c", None) is not None:
+            raise ValueError("Relativistic forces are not validated")
+        if hasattr(self.mf, "with_df"):
+            from pyscf.df import df, df_jk
+            if (not isinstance(self.mf, df_jk._DFHF) or type(self.mf.with_df) is not df.DF
+                    or not isinstance(self.mf, dft.rks.KohnShamDFT)
+                    or self.mf._numint._xc_type(self.mf.xc) not in ("LDA", "GGA")
+                    or any(self.mf._numint.rsh_and_hybrid_coeff(self.mf.xc, spin=self.mf.mol.spin))):
+                raise ValueError("Density fitting requires standard pure LDA/GGA RKS or UKS")
         if isinstance(self.mf, dft.rks.KohnShamDFT):
             if self.mf.do_nlc() or self.mf._numint._xc_type(self.mf.xc) not in ("LDA", "GGA", "HF"):
                 raise ValueError("Only LDA/GGA and their hybrids are validated")
@@ -107,6 +115,9 @@ class PySCFProvider:
         if (dm.shape != expected or not np.isfinite(dm).all()
                 or not np.allclose(dm, dm.conj().swapaxes(-1, -2), atol=1e-12, rtol=0)):
             raise ValueError("Density must be finite and Hermitian with the model's spin shape")
+        # Pure-functional DF-J depends on Re(P); the direct-J API requires float64.
+        if hasattr(self.mf, "with_df"):
+            return np.asarray(dm.real, dtype=float)
         return dm.real if self.density_convention == "paper_real" else dm
 
     def fock(self, density, time=0.):

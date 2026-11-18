@@ -39,6 +39,8 @@ class GPUResidentProvider(GPU4PySCFProvider):
             template = copy(self.mf)
             template.mo_coeff = template.mo_occ = template.mo_energy = None
             candidate = template.to_gpu()
+            if hasattr(candidate, "with_df"):
+                candidate.direct_scf = False
             for key in ("coords", "weights", "atm_idx", "quadrature_weights"):
                 value = getattr(self.mf.grids, key, None)
                 if value is not None:
@@ -81,6 +83,8 @@ class GPUResidentProvider(GPU4PySCFProvider):
             native.grids = self._gpu_mf.grids.copy()
             native.nlcgrids = self._gpu_mf.nlcgrids.copy()
             native._numint = copy(self._gpu_mf._numint)
+            if hasattr(native, "with_df"):
+                native.with_df = copy(self._gpu_mf.with_df)
             native.reset(mol)
             native._radiant_density = native._radiant_potential = None
         self.mf, self._gpu_mf = candidate, native
@@ -127,6 +131,8 @@ class GPUResidentProvider(GPU4PySCFProvider):
         if incremental and native.direct_scf and previous is not None and updates < 16:
             kwargs = dict(dm_last=native._radiant_density, vhf_last=previous)
         potential = native.get_veff(dm=density, **kwargs)
+        if not native.direct_scf:
+            return potential
         # Iteration needs J, not its energy; omitting ecoul avoids a scalar download.
         cached_density = density.copy()
         cached_j = SimpleNamespace(vj=potential.vj)

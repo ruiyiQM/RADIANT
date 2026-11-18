@@ -72,7 +72,7 @@ class GPUProviderContractTests(unittest.TestCase):
         hf = scf.RHF(mf.mol)
         hf.converged = True
         with patch.dict(sys.modules, {"cupy": None, "gpu4pyscf": None}):
-            for candidate in (hybrid, meta, hf, mf.density_fit()):
+            for candidate in (hybrid, meta, hf, hybrid.density_fit()):
                 with self.assertRaises(ValueError):
                     GPU4PySCFProvider(candidate)
             for mode in (None, 1, 'gpu'):

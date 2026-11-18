@@ -52,13 +52,14 @@ def _model(provider):
     if type(provider) not in (PySCFProvider, GPU4PySCFProvider, GPUResidentProvider):
         raise ValueError("Restart requires a built-in PySCF or GPU4PySCF provider")
     mf, mol = provider.mf, provider.mf.mol
-    if type(mf) not in (scf.hf.RHF, scf.uhf.UHF, dft.rks.RKS, dft.uks.UKS):
+    base = mf.undo_df() if hasattr(mf, "with_df") else mf
+    if type(base) not in (scf.hf.RHF, scf.uhf.UHF, dft.rks.RKS, dft.uks.UKS):
         raise ValueError("Restart requires a standard molecular mean-field class")
     if any(k != "get_occ" and (inspect.isroutine(v) or
             (callable(v) and callable(getattr(type(mf), k, None)))) for k, v in vars(mf).items()):
         raise ValueError("Restart cannot preserve custom mean-field methods")
     name = "GPU4PySCFProvider" if isinstance(provider, GPU4PySCFProvider) else type(provider).__name__
-    result = {"provider": name, "mean_field": type(mf).__name__,
+    result = {"provider": name, "mean_field": type(base).__name__,
               "density_convention": provider.density_convention,
               "symbols": [mol.atom_symbol(i) for i in range(mol.natm)],
               "charges": mol.atom_charges(), "basis": mol._basis, "cart": mol.cart,
@@ -66,6 +67,11 @@ def _model(provider):
               "settings": {k: getattr(mf, k, None) for k in
                            ("direct_scf", "direct_scf_tol", "small_rho_cutoff", "max_memory",
                             "xc", "nlc", "disp", "gcp")}}
+    if hasattr(mf, "with_df"):
+        from pyscf.df import df
+        if type(mf.with_df) is not df.DF or any(inspect.isroutine(v) for v in vars(mf.with_df).values()):
+            raise ValueError("Restart cannot preserve custom density fitting")
+        result["density_fitting"] = {"auxbasis": mf.with_df.auxbasis, "only_dfj": mf.only_dfj}
     if isinstance(mf, dft.rks.KohnShamDFT):
         if type(mf._numint) is not dft.numint.NumInt or any(inspect.isroutine(v) for v in vars(mf._numint).values()):
             raise ValueError("Restart cannot preserve custom numerical integration")
@@ -217,6 +223,8 @@ def load_checkpoint(path, providers):
                     raise ValueError("Invalid checkpoint quadrature shape")
             provider.mf._opt = {}
             provider.mf._eri = None
+            if hasattr(provider.mf, "with_df"):
+                provider.mf.with_df.reset(provider.mf.mol)
             if getattr(provider, "device_resident", False):
                 # Rebuild from the restored quadrature, never from transient GPU caches.
                 provider._gpu_mf = None

@@ -45,6 +45,8 @@ class GPU4PySCFProvider(PySCFProvider):
         if self._gpu_mf is None:
             self.mf.initialize_grids(self.mf.mol, density)
             candidate = self.mf.to_gpu()
+            if hasattr(candidate, "with_df"):
+                candidate.direct_scf = False
             # to_gpu resets grids: reuse the CPU quadrature, including its density pruning.
             candidate.grids.coords = cupy.asarray(self.mf.grids.coords)
             candidate.grids.weights = cupy.asarray(self.mf.grids.weights)
