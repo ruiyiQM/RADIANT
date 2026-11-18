@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .arrays import array_module, max_abs
+from .arrays import array_module
 
 
 @dataclass
@@ -33,10 +33,12 @@ class OrbitalState:
         for c, f in zip(self.coefficients, self.occupations):
             if c.ndim != 2 or f.ndim != 1 or c.shape != (nao, f.size):
                 raise ValueError("Orbital/occupation dimensions do not match")
-            if not xp.isfinite(c).all() or not np.isfinite(f).all():
+            if not np.isfinite(f).all():
                 raise ValueError("Orbitals and occupations must be finite")
             if not np.isin(f, (0, 1, 2) if len(self.coefficients) == 1 else (0, 1)).all():
                 raise ValueError("Fractional occupations are not supported")
+        if not xp.all(xp.stack([xp.isfinite(c).all() for c in self.coefficients])):
+            raise ValueError("Orbitals and occupations must be finite")
         self._weights = tuple(xp.asarray(f) for f in self.occupations)
         if xp is not np:
             for f in self.occupations:
@@ -63,16 +65,19 @@ class OrbitalState:
         result = object.__new__(OrbitalState)
         result.coefficients = tuple(xp.array(c, dtype=complex, copy=True) for c in coefficients)
         if len(result.coefficients) != len(self.coefficients) or any(
-                c.shape != old.shape or not xp.isfinite(c).all()
+                c.shape != old.shape
                 for c, old in zip(result.coefficients, self.coefficients)):
+            raise ValueError("Replacement orbitals must retain finite block dimensions")
+        if not xp.all(xp.stack([xp.isfinite(c).all() for c in result.coefficients])):
             raise ValueError("Replacement orbitals must retain finite block dimensions")
         result.occupations, result._weights = self.occupations, self._weights
         return result
 
     def orthogonality_error(self, overlap):
         xp = array_module(self.coefficients[0])
-        return max((max_abs(c.conj().T @ overlap @ c - xp.eye(c.shape[1]))
-                    for c in self.coefficients), default=0.)
+        errors = [xp.max(abs(c.conj().T @ overlap @ c - xp.eye(c.shape[1])))
+                  for c in self.coefficients if c.shape[1]]
+        return float(xp.max(xp.stack(errors))) if errors else 0.
 
 
 @dataclass

@@ -215,8 +215,8 @@ class ZVectorNAC:
         # complex FON-like minima have a degenerate occupied/virtual pair (delta = 0) that only the
         # kernel stabilises, so the diagonal preconditioner is floored
         preconditioner = xp.maximum(delta, .05)
-        z_re = self._solve(hessian, preconditioner, alpha.conj() + beta)
-        z_im = self._solve(hessian, preconditioner, 1j * (alpha.conj() - beta))
+        z_re, z_im = self._solve(hessian, preconditioner,
+                                xp.stack((alpha.conj() + beta, 1j * (alpha.conj() - beta))))
         relaxed = (xp.real(xp.einsum("ai,bxai->bx", z_re.conj(), rhs))
                    + 1j * xp.real(xp.einsum("ai,bxai->bx", z_im.conj(), rhs)))
         u_tv = u_t[..., nocc:, :]
@@ -297,12 +297,13 @@ class ZVectorNAC:
         sizes = [d.size for d in delta]
 
         def pack(parts):
-            z = xp.concatenate([p.ravel() for p in parts])
-            return xp.concatenate([z.real, z.imag])
+            z = xp.concatenate([p.reshape(*p.shape[:-2], -1) for p in parts], axis=-1)
+            return xp.concatenate([z.real, z.imag], axis=-1)
 
         def unpack(x):
-            z = x[:sum(sizes)] + 1j * x[sum(sizes):]
-            return [z[:sizes[0]].reshape(delta[0].shape), z[sizes[0]:].reshape(delta[1].shape)]
+            z = x[..., :sum(sizes)] + 1j * x[..., sum(sizes):]
+            return [z[..., :sizes[0]].reshape(*x.shape[:-1], *delta[0].shape),
+                    z[..., sizes[0]:].reshape(*x.shape[:-1], *delta[1].shape)]
 
         def hessian(x):
             u = unpack(x)
@@ -316,18 +317,21 @@ class ZVectorNAC:
         if xp is np:
             preconditioner = LinearOperator((n, n), matvec=lambda x: np.concatenate([floor, floor]) * x, dtype=float)
             operator = LinearOperator((n, n), matvec=hessian, dtype=float)
-        for part, target in ((1, [w[s][nocc[s]:].conj() for s in range(2)]),
-                             (1j, [1j * w[s][nocc[s]:].conj() for s in range(2)])):
-            b = pack(target)
+        targets = [pack([part * w[s][nocc[s]:].conj() for s in range(2)]) for part in (1, 1j)]
+        if xp is not np:
+            from .gpu_response import solve_indefinite
+            solutions, status = solve_indefinite(hessian, xp.stack(targets), xp.concatenate([floor, floor]),
+                                                self.tolerance, self.max_iterations)
+            if status != 0:
+                raise RuntimeError("Z-vector indefinite solve did not converge")
+        for index, (part, b) in enumerate(zip((1, 1j), targets)):
             if not xp.any(b):
                 continue
             # MINRES measures the residual in the preconditioner norm, i.e. roughly the error of z
             if xp is np:
                 z, status = minres(operator, b, M=preconditioner, rtol=self.tolerance, maxiter=self.max_iterations)
             else:
-                from .gpu_response import solve_indefinite
-                z, status = solve_indefinite(hessian, b, xp.concatenate([floor, floor]),
-                                              self.tolerance, self.max_iterations)
+                z = solutions[index]
             if status != 0:
                 raise RuntimeError("Z-vector indefinite solve did not converge")
             z = unpack(z)
@@ -335,10 +339,10 @@ class ZVectorNAC:
         return coupling
 
     def _solve(self, hessian, preconditioner, target):
-        """Diagonally preconditioned CG for the real-linear symmetric orbital hessian."""
+        """Batch independent CG recurrences through the same real-linear Hessian."""
         xp = array_module(target)
         def inner(a, b):
-            return float(xp.real(xp.sum(a.conj() * b)))
+            return xp.real(xp.sum(a.conj() * b, axis=(-2, -1), keepdims=True))
         z = target / preconditioner
         residual = target - hessian(z)
         direction = residual / preconditioner
@@ -348,12 +352,13 @@ class ZVectorNAC:
                 return z
             h = hessian(direction)
             curvature = inner(direction, h)
-            if curvature <= 0:
+            active = xp.max(abs(residual), axis=(-2, -1), keepdims=True) >= self.tolerance
+            if xp.any(active & (curvature <= 0)):
                 raise ValueError("The ground orbital Hessian is not positive: the ground is not a minimum")
-            step = rz / curvature
+            step = xp.where(active, rz, 0.) / xp.where(active, curvature, 1.)
             z, residual = z + step * direction, residual - step * h
             rz, previous = inner(residual, residual / preconditioner), rz
-            direction = residual / preconditioner + rz / previous * direction
+            direction = residual / preconditioner + rz / xp.where(previous != 0, previous, 1.) * direction
         if max_abs(residual) < self.tolerance:
             return z
         raise RuntimeError("Z-vector conjugate gradient did not converge")

@@ -70,13 +70,20 @@ def solve_indefinite(action, target, inverse_diagonal, tolerance, max_iterations
     """Use GPU4PySCF's device Krylov solver and verify the actual residual."""
     import cupy as xp
     from gpu4pyscf.lib.cupy_helper import krylov
-    norm = float(xp.linalg.norm(target))
-    if not norm:
+    norm = xp.linalg.norm(target, axis=-1, keepdims=True)
+    if not xp.any(norm):
         return xp.zeros_like(target), 0
     def shifted(vectors):
-        return xp.stack([inverse_diagonal * action(v) - v for v in xp.atleast_2d(vectors)])
-    z = norm * krylov(shifted, inverse_diagonal * target / norm,
-                      tol=.1*tolerance, lindep=(.1*tolerance)**2,
-                      max_cycle=max_iterations, verbose=0)
-    status = int(float(xp.linalg.norm(target-action(z))) > tolerance*norm)
-    return z, status
+        return inverse_diagonal * action(vectors) - vectors
+    z, residual = xp.zeros_like(target), target
+    # Deflate roundoff-sized Krylov directions; refine against the original equation.
+    for _ in range(3):
+        scale = xp.linalg.norm(residual, axis=-1, keepdims=True)
+        scale = xp.where(scale > 0, scale, 1.)
+        z += scale * krylov(shifted, inverse_diagonal * residual / scale,
+                           tol=.1*tolerance, lindep=max(1e-14, (.1*tolerance)**2),
+                           max_cycle=max_iterations, verbose=0)
+        residual = target-action(z)
+        if xp.all(xp.linalg.norm(residual, axis=-1, keepdims=True) <= tolerance*norm):
+            return z, 0
+    return z, 1

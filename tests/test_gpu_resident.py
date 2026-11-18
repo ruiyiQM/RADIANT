@@ -29,6 +29,29 @@ from test_restart import make_run
 
 
 class ResidentContractTests(unittest.TestCase):
+    def test_batched_real_linear_cg_matches_independent_dense_solve(self):
+        rng = np.random.default_rng(81)
+        a = rng.normal(size=(12, 12))
+        matrix = a @ a.T + 2*np.eye(12)
+        first = rng.normal(size=(2, 3)) + 1j*rng.normal(size=(2, 3))
+        targets = np.stack((first, .7*first, np.zeros_like(first), 1e-6*first.conj()))
+        def pack(x):
+            return np.concatenate((x.real.reshape(*x.shape[:-2], 6),
+                                   x.imag.reshape(*x.shape[:-2], 6)), axis=-1)
+        calls = []
+        def action(x):
+            calls.append(x.shape)
+            y = pack(x) @ matrix.T
+            return (y[..., :6] + 1j*y[..., 6:]).reshape(x.shape)
+        actual = ZVectorNAC(tolerance=1e-12)._solve(action, np.ones((2, 3)), targets)
+        expected = np.linalg.solve(matrix, pack(targets).T).T
+        assert_allclose(pack(actual), expected, atol=2e-12, rtol=0)
+        self.assertTrue(all(shape == targets.shape for shape in calls))
+        with self.assertRaisesRegex(ValueError, 'not positive'):
+            ZVectorNAC()._solve(lambda x: -x, np.ones((2, 3)), targets)
+        with self.assertRaisesRegex(RuntimeError, 'did not converge'):
+            ZVectorNAC(tolerance=1e-14, max_iterations=1)._solve(action, np.ones((2, 3)), targets)
+
     def test_incremental_potential_owns_density_and_failed_build_keeps_cache(self):
         provider=GPUResidentProvider(mean_field())
         from unittest.mock import Mock
@@ -88,6 +111,24 @@ class ResidentContractTests(unittest.TestCase):
 
 @unittest.skipUnless(find_spec('cupy') and find_spec('gpu4pyscf'),'Requires a real GPU')
 class ResidentHardwareTests(unittest.TestCase):
+    def test_batched_indefinite_response_matches_dense_solve(self):
+        import cupy as cp
+        from radiant.backends.gpu_response import solve_indefinite
+        rng = np.random.default_rng(16)
+        q = np.linalg.qr(rng.normal(size=(12, 12)))[0]
+        matrix = q @ np.diag(np.r_[-np.arange(1, 7), np.arange(1, 7)]) @ q.T
+        device = cp.asarray(matrix)
+        for b in (rng.normal(size=(2, 12)), np.zeros((2, 12)),
+                  np.stack((np.zeros(12), np.ones(12))), np.ones((2, 12))):
+            calls = []
+            def action(x):
+                calls.append(x.shape)
+                return x @ device.T
+            actual, status = solve_indefinite(action, cp.asarray(b), cp.ones(12), 1e-10, 200)
+            self.assertEqual(status, 0)
+            assert_allclose(to_host(actual), np.linalg.solve(matrix, b.T).T, atol=2e-10, rtol=0)
+            self.assertTrue(all(len(shape) == 2 for shape in calls))
+
     @unittest.skipUnless(os.environ.get('RADIANT_TEST_DEVICE_J_PATCH')=='1',
                          'Requires the bundled isolated GPU4PySCF device-J patch')
     def test_patched_coulomb_transform_receives_device_tensor(self):
@@ -221,9 +262,16 @@ class ResidentHardwareTests(unittest.TestCase):
                     uploads.append(value.shape)
                     self.assertLess(value.ndim,2,'Host matrix entered the electronic iteration')
                 return original_asarray(value,*args,**kwargs)
-            with patch.object(cp,'asnumpy',side_effect=AssertionError('Device matrix exported during iteration')), \
+            downloads=[];original_asnumpy=cp.asnumpy
+            def scalar_statistics(value,*args,**kwargs):
+                self.assertEqual(value.ndim,1,'Device matrix exported during iteration')
+                self.assertLessEqual(value.size,3,'Only convergence statistics may be exported')
+                downloads.append(value.shape)
+                return original_asnumpy(value,*args,**kwargs)
+            with patch.object(cp,'asnumpy',scalar_statistics), \
                     patch.object(cp,'asarray',guarded):
                 actual,_=crank_nicolson(resident,ds,lambda d,t:functional(cp,dh,d),0.,.1,options=options)
+            self.assertTrue(downloads)
             assert_allclose(cp.asnumpy(actual.density()),expected.density(),atol=2e-8,rtol=0)
             self.assertTrue(all(isinstance(c,cp.ndarray) for c in actual.coefficients))
 

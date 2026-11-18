@@ -33,7 +33,7 @@ An unconverged candidate is never returned as an accepted state.
 from dataclasses import dataclass
 
 import numpy as np
-from .arrays import array_module, max_abs, cho_factor, cho_solve, cholesky, eigh, lu_factor, lu_solve, solve_triangular
+from .arrays import array_module, max_abs, to_host, cho_factor, cho_solve, cholesky, eigh, lu_factor, lu_solve, solve_triangular
 
 from .anderson import AndersonAcceleration
 from .state import OrbitalState
@@ -154,8 +154,10 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
     def evaluate(trial, t, iterations=0):
         value = xp.asarray(fock(trial.density(), t), dtype=complex)
         matrices = value[None] if nspin == 1 else value
-        if (matrices.shape != (nspin, *np.shape(overlap)) or not xp.isfinite(matrices).all()
-                or not xp.allclose(matrices, matrices.conj().transpose(0, 2, 1), atol=1e-12, rtol=0)):
+        if matrices.shape != (nspin, *np.shape(overlap)):
+            raise StepFailure("Fock provider returned invalid/non-Hermitian matrices", iterations=iterations)
+        if not (xp.isfinite(matrices).all() &
+                xp.allclose(matrices, matrices.conj().transpose(0, 2, 1), atol=1e-12, rtol=0)):
             raise StepFailure("Fock provider returned invalid/non-Hermitian matrices", iterations=iterations)
         return matrices * alpha
 
@@ -179,12 +181,15 @@ def crank_nicolson(state, overlap, fock, time, dt, *, alpha=1., options=CNOption
             candidate = solve((start + guess) / 2)
             final = evaluate(candidate, time + dt)
             average = (start + final) / 2
-            residual = max(max_abs(
-                (overlap + .5j * dt * h) @ new - (overlap - .5j * dt * h) @ old)
-                for h, new, old in zip(average, candidate.coefficients, state.coefficients))
-            change = max(max_abs(new - old)
-                         for new, old in zip(candidate.coefficients, previous.coefficients))
-            orthogonality = candidate.orthogonality_error(overlap)
+            equations = [
+                (overlap + .5j * dt * h) @ new - (overlap - .5j * dt * h) @ old
+                for h, new, old in zip(average, candidate.coefficients, state.coefficients)]
+            differences = [new - old for new, old in zip(candidate.coefficients, previous.coefficients)]
+            grams = [c.conj().T @ overlap @ c - xp.eye(c.shape[1]) for c in candidate.coefficients]
+            statistics = xp.stack([xp.max(xp.stack([
+                xp.max(abs(value)) if value.size else xp.asarray(0.) for value in group]))
+                for group in (equations, differences, grams)])
+            residual, change, orthogonality = map(float, to_host(statistics))
             if (residual < options.tolerance and change < options.tolerance
                     and (iteration > 1 or options.variant == "cn")):
                 if orthogonality > 1e-8:
@@ -678,9 +683,11 @@ def _parallel_transport(state, overlap, evaluate, time, dt, options):
             mixed = accelerator.compute(xp.stack((current.real, current.imag)),
                                         xp.stack((candidate.real, candidate.imag)))
             vector = mixed[0] + 1j * mixed[1]
-            if not xp.isfinite(vector).all():
+            valid, change = to_host(xp.stack((xp.isfinite(vector).all(),
+                                             xp.max(abs(vector-current)) if vector.size else xp.asarray(0.))))
+            if not valid:
                 raise StepFailure(f"{label} trial orbitals are not finite", residual=residual, iterations=iteration)
-            change = max_abs(vector - current)
+            change = float(change)
             blocks = [vector[sizes[i]:sizes[i+1]].reshape(c.shape) for i, c in enumerate(initial)]
         else:
             raise StepFailure(f"{label} nonlinear iteration did not converge", residual=residual,
