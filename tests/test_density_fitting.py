@@ -11,12 +11,15 @@ from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_allclose
+from pyscf import dft, gto, scf
 
 from radiant.backends.pyscf import PySCFProvider
 from radiant.backends.gpu_resident import GPUResidentProvider
 from radiant.backends.gpu_pyscf import GPU4PySCFProvider
 from radiant.backends.pyscf_nac import ZVectorNAC
 from radiant.core.arrays import to_host
+from radiant.core.execution import LocalExecution
+from radiant.core.overlap import pair_overlap
 from radiant.core.state import OrbitalState
 from radiant.core.transport import transport
 from radiant.restart import load_checkpoint
@@ -28,6 +31,19 @@ def fitted_field(unrestricted=False, xc='pbe'):
     mf = mean_field(unrestricted, xc).density_fit(auxbasis='weigend', only_dfj=True)
     mf.kernel()
     assert mf.converged
+    return mf
+
+
+def tight_df_pbe(mol, unrestricted, dm0=None, mom=None):
+    """DF-J PBE converged to 1e-13; mom = (coefficients, occupation) follows that determinant."""
+    mf = (dft.UKS if unrestricted else dft.RKS)(mol, xc='pbe')
+    mf.grids.level, mf.grids.prune, mf.conv_tol, mf.chkfile = 1, None, 1e-13, None
+    mf = mf.density_fit(auxbasis='weigend', only_dfj=True)
+    if mom is not None:
+        mf = scf.addons.mom_occ(mf, *mom)
+        dm0 = mf.make_rdm1(*mom)
+    mf.kernel(dm0=dm0)
+    assert mf.converged and (mom is None or np.array_equal(mf.mo_occ, mom[1]))
     return mf
 
 
@@ -49,6 +65,43 @@ class DensityFittingTests(unittest.TestCase):
                         moved.prepare_geometry(positions)
                         energies.append(moved.energy(transport(state, provider.overlap, moved.overlap)))
                     self.assertAlmostEqual(force[0, axis], -(energies[0]-energies[1])/2e-4, delta=3e-7)
+
+    def test_zvector_nac_matches_df_static_finite_differences(self):
+        # Directional static FD along d and two random axes. The error is 3e-5 |d| (RKS) and 4e-5 |d| (UKS);
+        # dropping the auxiliary-basis response of the DF Hessian h1 raises it to 8e-4 and 5e-3.
+        h = 1e-3
+        for unrestricted in (False, True):
+            with self.subTest(unrestricted=unrestricted):
+                mol = gto.M(atom='He 0 0 0; H .2 0 1.4', basis='6-31g', unit='Bohr',
+                            charge=0 if unrestricted else 1, spin=int(unrestricted), verbose=0)
+                ground = tight_df_pbe(mol, unrestricted)
+                if unrestricted:   # both determinants relaxed: beta HOMO -> LUMO by MOM
+                    occupation = np.array(ground.mo_occ, dtype=float)
+                    nb = int(occupation[1].sum()); occupation[1, nb-1], occupation[1, nb] = 0, 1
+                    fields = (ground, tight_df_pbe(mol, True, mom=(ground.mo_coeff, occupation)))
+                    run = LocalExecution([PySCFProvider(mf) for mf in fields])
+                else:              # relaxed ground, Loewdin-transported 2/1 excitation
+                    provider = PySCFProvider(ground)
+                    excited = OrbitalState((ground.mo_coeff[:, :2],), ([1., 1.],))
+                    run = LocalExecution([provider, deepcopy(provider)], [provider.initial_state(), excited])
+                d = ZVectorNAC(tolerance=1e-12).compute(run).raw
+                for v in [d.real] + list(np.random.default_rng(5).normal(size=(2, *d.shape))):
+                    v = v/np.linalg.norm(v)
+                    overlaps = []
+                    for sign in (1, -1):
+                        moved = mol.set_geom_(mol.atom_coords() + sign*h*v, unit='Bohr', inplace=False)
+                        if unrestricted:
+                            moved_run = LocalExecution([PySCFProvider(tight_df_pbe(
+                                moved, True, mom=(mf.mo_coeff, np.array(mf.mo_occ, dtype=float)))) for mf in fields])
+                        else:
+                            moved_provider = PySCFProvider(tight_df_pbe(moved, False, dm0=ground.make_rdm1()))
+                            moved_run = LocalExecution([moved_provider, deepcopy(moved_provider)],
+                                                       [moved_provider.initial_state(),
+                                                        transport(excited, provider.overlap, moved_provider.overlap)])
+                        o = pair_overlap(run.gauge, moved_run.gauge, gto.intor_cross('int1e_ovlp', mol, moved))
+                        overlaps.append(o*(np.diag(o).conj()/abs(np.diag(o)))[None, :])
+                    fd = (overlaps[0] - overlaps[1])/(2*h)
+                    self.assertLess(abs(np.sum(d.real*v) - .5*(fd[0, 1] - fd[1, 0]).real), 2e-4*np.linalg.norm(d))
 
     def test_restart_preserves_df_model_and_rejects_auxiliary_basis_changes(self):
         for unrestricted in (False, True):
